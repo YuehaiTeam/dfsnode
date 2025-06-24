@@ -78,7 +78,7 @@ pub async fn load_config_from_file(
     config_path: &str,
 ) -> Result<()> {
     let content = tokio::fs::read_to_string(config_path).await?;
-    let config_data: Config = serde_yaml::from_str(&content)?;
+    let config_data: Config = serde_yml::from_str(&content)?;
     let optimized_config = OptimizedConfig::from_config(config_data.clone());
     let version = config_data.version.unwrap_or(0);
 
@@ -115,7 +115,7 @@ pub async fn load_config_from_central(
 
     let response = request.send().await?;
     let config_text = response.text().await?;
-    let config_data: Config = serde_yaml::from_str(&config_text)?;
+    let config_data: Config = serde_yml::from_str(&config_text)?;
 
     let new_version = config_data.version.unwrap_or(0);
     let current_version = config.load().get_version();
