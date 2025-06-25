@@ -45,7 +45,7 @@ impl OptimizedConfig {
 
         // 预计算 Prometheus 认证头
         let prometheus_auth_header = config
-            .prometheus_token
+            .management_token
             .as_ref()
             .map(|token| format!("Bearer {}", token));
 
@@ -70,7 +70,7 @@ impl OptimizedConfig {
 pub struct Config {
     pub version: Option<u64>,
     pub paths: HashMap<String, PathConfig>,
-    pub prometheus_token: Option<String>,
+    pub management_token: Option<String>,
 }
 
 pub async fn load_config_from_file(
