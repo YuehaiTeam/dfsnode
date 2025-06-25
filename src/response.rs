@@ -24,6 +24,7 @@ pub enum ResBody {
         bytes_sent: u32,
         metrics: Arc<StaticMetrics>,
     },
+    Dav(dav_server::body::Body),
     Bytes(Bytes),
     Empty,
 }
@@ -57,6 +58,10 @@ impl hyper::body::Body for ResBody {
                     }
                 }
                 Poll::Ready(bytes)
+            }
+            ResBody::Dav(ref mut dav_body) => {
+                let result = ready!(Pin::new(dav_body).poll_next(cx));
+                Poll::Ready(result.map(|res| res.map(Frame::data)))
             }
             ResBody::Empty => return Poll::Ready(None),
             ResBody::Bytes(ref mut bytes) => {

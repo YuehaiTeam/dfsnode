@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use arc_swap::ArcSwap;
+use dav_server::{DavHandler, fakels::FakeLs, localfs::LocalFs};
 use hyper_staticfile::Static;
 use tokio::time::Duration as TokioDuration;
 
@@ -19,6 +20,8 @@ pub struct AppState {
     pub static_service: Static,
     pub http_client: reqwest::Client,
     pub fs_cache: Arc<FileSystemCache>,
+    pub bt_api: librqbit::Api,
+    pub dav_server: DavHandler,
 }
 
 impl AppState {
@@ -27,6 +30,7 @@ impl AppState {
         central_url: Option<String>,
         auth_header: Option<String>,
         server_id: Option<String>,
+        bt_session: Arc<librqbit::Session>,
     ) -> Self {
         let static_service = Static::new(&data_dir);
 
@@ -40,6 +44,12 @@ impl AppState {
             .build()
             .expect("Failed to create HTTP client");
 
+        let dav_server = DavHandler::builder()
+            .filesystem(LocalFs::new(&data_dir, true, false, false))
+            .locksystem(FakeLs::new())
+            .strip_prefix("/-/dav")
+            .build_handler();
+
         Self {
             config: Arc::new(ArcSwap::from_pointee(OptimizedConfig::default())),
             data_dir,
@@ -49,6 +59,8 @@ impl AppState {
             static_service,
             http_client,
             fs_cache: Arc::new(FileSystemCache::new()),
+            bt_api: librqbit::Api::new(bt_session, None),
+            dav_server,
         }
     }
 }

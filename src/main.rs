@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
@@ -44,13 +44,22 @@ struct Args {
     /// Port to listen on
     #[arg(long, default_value = "8093")]
     port: u16,
+
+    /// BitTorrent port to listen on (0 for random port)
+    #[arg(long, default_value = "0")]
+    bt_port: u16,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // log info level for production
+    // Initialize tracing with env-filter support
+    // Can be controlled via RUST_LOG environment variable
+    // Example: RUST_LOG=info,dfsnode=debug
     tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::INFO)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
         .init();
 
     // Register metrics
@@ -76,11 +85,27 @@ async fn main() -> Result<()> {
         (None, None, None)
     };
 
-    let state = AppState::new(data_dir, central_url, auth_header, server_id);
+    let bt_session = librqbit::Session::new_with_opts(
+        std::env::temp_dir(),
+        librqbit::SessionOptions {
+            disable_dht: true,
+            listen: Some(librqbit::ListenerOptions {
+                mode: librqbit::ListenerMode::TcpAndUtp,
+                listen_addr: std::net::SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 0], args.bt_port)),
+                enable_upnp_port_forwarding: false,
+                utp_opts: None,
+            }),
+            ..Default::default()
+        },
+    )
+    .await
+    .context("Failed to create BitTorrent session")?;
+
+    let state = AppState::new(data_dir, central_url, auth_header, server_id, bt_session);
 
     // Load initial config
     if let Some(config_path) = args.config {
-        load_config_from_file(&state.config, &config_path).await?;
+        load_config_from_file(&state.config, &config_path, &state).await?;
     } else {
         load_config_from_central(
             &state.config,
@@ -88,6 +113,7 @@ async fn main() -> Result<()> {
             state.server_id.as_deref(),
             state.auth_header.as_deref(),
             &state.http_client,
+            &state,
         )
         .await?;
     }
@@ -99,7 +125,7 @@ async fn main() -> Result<()> {
         let server_id = state.server_id.clone();
         let auth_header = state.auth_header.clone();
         let http_client = state.http_client.clone();
-
+        let state_cl = state.clone();
         tokio::spawn(async move {
             config_refresh_task(
                 config_clone,
@@ -107,6 +133,7 @@ async fn main() -> Result<()> {
                 server_id,
                 auth_header,
                 http_client,
+                &state_cl,
             )
             .await;
         });

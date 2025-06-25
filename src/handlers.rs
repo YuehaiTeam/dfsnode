@@ -24,6 +24,23 @@ pub async fn handle_request(
     if path == "/-/metrics" {
         return handle_metrics_request(&state, req).await;
     }
+    // Handle BT tasks endpoint
+    if path == "/-/synctasks" {
+        return handle_bt_request(&state, req).await;
+    }
+
+    // handle webdav requests /-/dav/*
+    if path.starts_with("/-/dav/") {
+        // verify auth header
+        if let Err(response) = management_validation(&state, &req).await {
+            return Ok(response);
+        }
+        return Ok(state
+            .dav_server
+            .handle(req)
+            .await
+            .map(ResBody::Dav));
+    }
 
     if method != Method::GET && method != Method::HEAD {
         let response = Response::builder()
@@ -150,10 +167,10 @@ pub async fn handle_request(
     }
 }
 
-pub async fn handle_metrics_request(
+pub async fn management_validation(
     state: &AppState,
-    req: Request<hyper::body::Incoming>,
-) -> Result<Response<ResBody>, std::io::Error> {
+    req: &Request<hyper::body::Incoming>,
+) -> Result<(), hyper::Response<ResBody>> {
     // Check Authorization header using precomputed auth header
     let auth_valid = {
         let config = state.config.load();
@@ -178,6 +195,17 @@ pub async fn handle_metrics_request(
             .header("Content-Type", "text/plain")
             .body(ResBody::Empty)
             .unwrap();
+        return Err(response);
+    }
+    Ok(())
+}
+
+pub async fn handle_metrics_request(
+    state: &AppState,
+    req: Request<hyper::body::Incoming>,
+) -> Result<Response<ResBody>, std::io::Error> {
+    // auth
+    if let Err(response) = management_validation(state, &req).await {
         return Ok(response);
     }
 
@@ -202,5 +230,32 @@ pub async fn handle_metrics_request(
         .body(ResBody::Bytes(Bytes::from(buffer)))
         .unwrap();
 
+    Ok(response)
+}
+
+pub async fn handle_bt_request(
+    state: &AppState,
+    req: Request<hyper::body::Incoming>,
+) -> Result<Response<ResBody>, std::io::Error> {
+    // auth
+    if let Err(response) = management_validation(state, &req).await {
+        return Ok(response);
+    }
+
+    let bt_api = state
+        .bt_api
+        .api_torrent_list_ext(librqbit::api::ApiTorrentListOpts { with_stats: true });
+
+    let total_stats = state.bt_api.api_session_stats();
+    let resp_json = serde_json::json!({
+        "torrents": bt_api.torrents,
+        "session": total_stats
+    });
+    let resp_bytes = Bytes::from(serde_json::to_vec(&resp_json).unwrap());
+    let response = Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", "application/json; charset=utf-8")
+        .body(ResBody::Bytes(resp_bytes))
+        .unwrap();
     Ok(response)
 }
