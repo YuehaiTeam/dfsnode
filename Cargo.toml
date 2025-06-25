@@ -7,13 +7,7 @@ edition = "2024"
 hyper = { version = "1.6.0", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["tokio", "server-auto"] }
 hyper-staticfile = "0.10"
-tokio = { version = "1.45.1", features = [
-    "rt-multi-thread",
-    "net",
-    "fs",
-    "time",
-    "macros",
-] }
+tokio = { version = "1.45.1", features = ["full"] }
 clap = { version = "4.5", features = ["derive"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_yml = "0.0.12"
@@ -40,6 +34,9 @@ radix_trie = "0.2"
 arc-swap = "1.7"
 moka = { version = "0.12", features = ["future"] }
 chrono = { version = "0.4", features = ["serde"] }
+librqbit = { version = "8.1.1", default-features = false, features = [
+    "rust-tls",
+] }
 
 [profile.release]
 lto = true
