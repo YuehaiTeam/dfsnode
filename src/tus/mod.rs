@@ -1,3 +1,5 @@
+pub mod handler;
+
 use anyhow::{Context, Result, bail};
 use base64::{Engine as _, engine::general_purpose};
 use sha1::{Sha1, Digest};
@@ -327,14 +329,13 @@ impl TusUploadManager {
         let mut cleaned = 0usize;
         for id in expired {
             if let Some(session) = sessions.remove(&id) {
-                if session.temp_file.exists() {
-                    if let Err(e) = std::fs::remove_file(&session.temp_file) {
+                if session.temp_file.exists()
+                    && let Err(e) = std::fs::remove_file(&session.temp_file) {
                         warn!(
                             "Failed to remove expired temp file {:?}: {}",
                             session.temp_file, e
                         );
                     }
-                }
                 cleaned += 1;
                 debug!("Cleaned up expired TUS session: {}", id);
             }

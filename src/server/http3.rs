@@ -8,7 +8,7 @@ use http_body_util::BodyExt;
 use tower::Service;
 use tracing::info;
 
-use crate::tls;
+use crate::server::tls;
 
 /// Start an HTTP/3 (QUIC) server on the given UDP port.
 ///

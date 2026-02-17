@@ -6,7 +6,7 @@ use tokio_rustls::TlsAcceptor;
 use tower::Service;
 use tracing::info;
 
-use crate::tls;
+use crate::server::tls;
 
 /// Start an HTTPS server on the given port.
 pub async fn serve(

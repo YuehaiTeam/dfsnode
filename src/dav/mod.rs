@@ -4,7 +4,9 @@ use std::sync::Arc;
 use dav_server::davpath::DavPath;
 use dav_server::fs::*;
 
-use crate::checksum::{ChecksumManager, format_oc_checksums};
+pub mod checksum;
+
+use crate::dav::checksum::{ChecksumManager, format_oc_checksums};
 
 const OC_NS: &str = "http://owncloud.org/ns";
 
@@ -105,10 +107,7 @@ impl DavFileSystem for ChecksumAwareFileSystem {
 
         Box::pin(async move {
             // Get base props from inner filesystem
-            let mut props = match DavFileSystem::get_props(&*self.inner, path, do_content).await {
-                Ok(p) => p,
-                Err(_) => Vec::new(),
-            };
+            let mut props: Vec<DavProp> = (DavFileSystem::get_props(&*self.inner, path, do_content).await).unwrap_or_default();
 
             // Add checksum property if this is a file with checksums
             if let Ok(Some(checksums)) = checksum_manager.get_checksums(&fs_path).await {

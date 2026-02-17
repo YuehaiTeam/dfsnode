@@ -97,11 +97,7 @@ impl ChecksumManager {
         if cached.file_size != current_size {
             return None;
         }
-        let mtime_diff = if current_mtime > cached.mtime_secs {
-            current_mtime - cached.mtime_secs
-        } else {
-            cached.mtime_secs - current_mtime
-        };
+        let mtime_diff = current_mtime.abs_diff(cached.mtime_secs);
         if mtime_diff > MTIME_TOLERANCE_SECS {
             return None;
         }

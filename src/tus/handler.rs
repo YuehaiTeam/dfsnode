@@ -55,24 +55,28 @@ pub fn tus_routes(prefix: &str, manager: Arc<TusUploadManager>, root: PathBuf) -
 
 /// Check that Tus-Resumable header is present and equals "1.0.0".
 /// Returns Err(412) if missing or wrong.
-fn check_tus_resumable(headers: &HeaderMap) -> Result<(), Response> {
+fn check_tus_resumable(headers: &HeaderMap) -> Result<(), Box<Response>> {
     match headers.get("tus-resumable") {
         Some(v) if v == "1.0.0" => Ok(()),
         Some(v) => {
             warn!("Unsupported TUS version: {:?}", v);
-            Err((
+            Err(Box::new(
+                (
+                    StatusCode::PRECONDITION_FAILED,
+                    [("tus-resumable", "1.0.0")],
+                    format!("Unsupported TUS version: {:?}", v),
+                )
+                    .into_response(),
+            ))
+        }
+        None => Err(Box::new(
+            (
                 StatusCode::PRECONDITION_FAILED,
                 [("tus-resumable", "1.0.0")],
-                format!("Unsupported TUS version: {:?}", v),
+                "Missing Tus-Resumable header",
             )
-                .into_response())
-        }
-        None => Err((
-            StatusCode::PRECONDITION_FAILED,
-            [("tus-resumable", "1.0.0")],
-            "Missing Tus-Resumable header",
-        )
-            .into_response()),
+                .into_response(),
+        )),
     }
 }
 
@@ -101,7 +105,7 @@ async fn tus_create(
     _body: Bytes,
 ) -> Response {
     if let Err(r) = check_tus_resumable(&headers) {
-        return r;
+        return *r;
     }
 
     // Parse Upload-Length (required)
@@ -224,12 +228,12 @@ async fn tus_patch(
     body: Bytes,
 ) -> Response {
     if let Err(r) = check_tus_resumable(&headers) {
-        return r;
+        return *r;
     }
 
     // Validate Content-Type
-    if let Some(ct) = headers.get("content-type") {
-        if ct != "application/offset+octet-stream" {
+    if let Some(ct) = headers.get("content-type")
+        && ct != "application/offset+octet-stream" {
             return (
                 StatusCode::UNSUPPORTED_MEDIA_TYPE,
                 [("tus-resumable", "1.0.0")],
@@ -237,7 +241,6 @@ async fn tus_patch(
             )
                 .into_response();
         }
-    }
 
     // Parse Upload-Offset
     let upload_offset = match parse_header_u64(&headers, "upload-offset") {
@@ -357,7 +360,7 @@ async fn tus_head(
     headers: HeaderMap,
 ) -> Response {
     if let Err(r) = check_tus_resumable(&headers) {
-        return r;
+        return *r;
     }
 
     match state.manager.get_session(&session_id).await {
@@ -398,7 +401,7 @@ async fn tus_delete(
     headers: HeaderMap,
 ) -> Response {
     if let Err(r) = check_tus_resumable(&headers) {
-        return r;
+        return *r;
     }
 
     match state.manager.delete_session(&session_id).await {

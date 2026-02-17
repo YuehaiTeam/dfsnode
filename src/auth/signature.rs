@@ -71,7 +71,7 @@ fn verify_signature(
 
     // Parse ranges from remaining bytes (starting at 104), each range is 16 hex chars
     let ranges_bytes = &sign_bytes[104..];
-    if ranges_bytes.len() % 16 != 0 {
+    if !ranges_bytes.len().is_multiple_of(16) {
         return Err("invalid range length in signature".into());
     }
 
