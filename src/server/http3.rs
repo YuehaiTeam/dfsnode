@@ -5,46 +5,111 @@ use std::sync::Arc;
 use axum::Router;
 use bytes::Buf;
 use http_body_util::BodyExt;
+use tokio::sync::watch;
 use tower::Service;
 use tracing::info;
 
 use crate::server::tls;
+use crate::stun::{self, StunConfig};
 
-/// Start an HTTP/3 (QUIC) server on the given UDP port.
+/// Handle returned by [`spawn()`] for the HTTP/3 server.
 ///
-/// Bridges h3/quinn connections into an axum Router, following the h3-axum pattern:
-/// each QUIC request is converted into an `http::Request` and dispatched through
-/// the same axum Router used by HTTP/HTTPS, making all routes and middleware shared.
-pub async fn serve(
+/// Contains the server task handle and the public address watch channel
+/// (populated only when STUN is active, stays `None` otherwise).
+pub struct Http3Handle {
+    pub task: tokio::task::JoinHandle<anyhow::Result<()>>,
+    pub public_addr: watch::Receiver<Option<SocketAddr>>,
+}
+
+/// Spawn an HTTP/3 (QUIC) server, optionally with STUN NAT traversal.
+///
+/// When `stun_config` is provided:
+/// 1. A raw UDP socket is created manually (same port)
+/// 2. Cloned for the STUN keepalive sender
+/// 3. Wrapped in a [`StunDemuxSocket`] that intercepts STUN responses
+/// 4. Passed to `Endpoint::new_with_abstract_socket()`
+/// 5. A background keepalive task is spawned
+///
+/// When `stun_config` is `None`, uses the standard `Endpoint::server()`.
+pub fn spawn(
     port: u16,
     cert_path: &Path,
     key_path: &Path,
     app: Router,
-) -> anyhow::Result<()> {
+    stun_config: Option<StunConfig>,
+) -> anyhow::Result<Http3Handle> {
     let rustls_config = tls::build_quic_config(cert_path, key_path)?;
 
     let quic_server_config =
         quinn::crypto::rustls::QuicServerConfig::try_from(rustls_config.clone())?;
     let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_server_config));
 
-    // HTTP/3 doesn't use unidirectional streams for request/response
     let mut transport = quinn::TransportConfig::default();
     transport.max_concurrent_uni_streams(0_u8.into());
     server_config.transport_config(Arc::new(transport));
 
     let addr: SocketAddr = format!("0.0.0.0:{port}").parse()?;
-    let endpoint = quinn::Endpoint::server(server_config, addr)?;
-    info!("HTTP/3 server listening on https://{addr} (QUIC/UDP)");
 
-    while let Some(incoming) = endpoint.accept().await {
-        let app = app.clone();
-        tokio::spawn(async move {
-            if let Err(e) = handle_connection(incoming, app).await {
-                tracing::debug!("HTTP/3 connection error: {e}");
-            }
-        });
-    }
+    // Build endpoint with or without STUN
+    let (endpoint, public_addr_rx) = if let Some(stun_cfg) = stun_config {
+        // Manual socket creation for STUN demuxing
+        let raw_socket = std::net::UdpSocket::bind(addr)?;
+        raw_socket.set_nonblocking(true)?;
 
+        let runtime: Arc<dyn quinn::Runtime> = Arc::new(quinn::TokioRuntime);
+
+        let stun_setup = stun::setup_stun_socket(raw_socket, stun_cfg, &runtime)?;
+
+        let endpoint = quinn::Endpoint::new_with_abstract_socket(
+            quinn::EndpointConfig::default(),
+            Some(server_config),
+            stun_setup.socket,
+            runtime,
+        )?;
+
+        // Start STUN keepalive task
+        stun::spawn_stun_keepalive(stun_setup.keepalive_socket, stun_setup.config);
+
+        info!("HTTP/3 server listening on https://{addr} (QUIC/UDP) with STUN NAT traversal");
+        (endpoint, stun_setup.public_addr_rx)
+    } else {
+        // Standard path — no STUN
+        let endpoint = quinn::Endpoint::server(server_config, addr)?;
+        let (_, rx) = watch::channel(None);
+        info!("HTTP/3 server listening on https://{addr} (QUIC/UDP)");
+        (endpoint, rx)
+    };
+
+    let task = tokio::spawn(async move {
+        while let Some(incoming) = endpoint.accept().await {
+            let app = app.clone();
+            tokio::spawn(async move {
+                if let Err(e) = handle_connection(incoming, app).await {
+                    tracing::debug!("HTTP/3 connection error: {e}");
+                }
+            });
+        }
+        Ok(())
+    });
+
+    Ok(Http3Handle {
+        task,
+        public_addr: public_addr_rx,
+    })
+}
+
+/// Start an HTTP/3 (QUIC) server on the given UDP port (without STUN).
+///
+/// Convenience wrapper around [`spawn()`] that awaits the task.
+/// Kept for backward compatibility.
+pub async fn serve(
+    port: u16,
+    cert_path: &Path,
+    key_path: &Path,
+    app: Router,
+) -> anyhow::Result<()> {
+    let handle = spawn(port, cert_path, key_path, app, None)?;
+    handle.task.await??;
     Ok(())
 }
 

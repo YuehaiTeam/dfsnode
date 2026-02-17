@@ -58,6 +58,23 @@ pub struct Args {
     /// Mutually exclusive with --username, --password, --sign-key.
     #[arg(long)]
     pub config: Option<String>,
+
+    /// STUN server address for NAT traversal (e.g. "stun.l.google.com:19302").
+    /// Only meaningful with --http3-port. When set, the HTTP/3 server will
+    /// periodically send STUN Binding Requests to discover its public UDP
+    /// address and keep the NAT mapping alive.
+    #[arg(long)]
+    pub stun_server: Option<String>,
+
+    /// Interval in seconds between STUN keepalive requests (default: 20).
+    #[arg(long)]
+    pub stun_interval_secs: Option<u64>,
+
+    /// Webhook URL to notify when public address changes (via STUN).
+    /// Supports basic auth embedded in URL, e.g. "https://user:pass@example.com/hook".
+    /// The public address (ip:port) is sent as POST body in plain text.
+    #[arg(long)]
+    pub webhook_url: Option<String>,
 }
 
 impl Args {
@@ -96,6 +113,16 @@ impl Args {
             anyhow::bail!(
                 "--config is mutually exclusive with --username, --password, and --sign-key"
             );
+        }
+
+        // --stun-server requires --http3-port
+        if self.stun_server.is_some() && self.http3_port.is_none() {
+            anyhow::bail!("--stun-server requires --http3-port to be specified");
+        }
+
+        // --stun-interval-secs must be positive
+        if let Some(0) = self.stun_interval_secs {
+            anyhow::bail!("--stun-interval-secs must be greater than 0");
         }
 
         Ok(())

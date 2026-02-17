@@ -15,6 +15,10 @@ pub struct FileConfig {
     pub sign_key: Option<String>,
     pub paths: Option<HashMap<String, PathAuthConfig>>,
     pub tus: Option<TusFileConfig>,
+    pub stun: Option<StunFileConfig>,
+    /// Webhook URL to call when STUN-discovered public address changes.
+    /// Supports basic auth in URL: "https://user:pass@host/path"
+    pub webhook_url: Option<String>,
 }
 
 /// Per-path authentication override.
@@ -39,6 +43,15 @@ pub struct TusFileConfig {
     pub upload_timeout_hours: Option<u64>,
     pub max_concurrent_uploads: Option<usize>,
     pub max_upload_size: Option<u64>,
+}
+
+/// STUN NAT traversal configuration from the config file.
+#[derive(Deserialize, Debug, Clone)]
+pub struct StunFileConfig {
+    /// STUN server address, e.g. "stun.l.google.com:19302"
+    pub server: Option<String>,
+    /// Keepalive interval in seconds (default: 20)
+    pub interval_secs: Option<u64>,
 }
 
 /// Load and validate a YAML configuration file.

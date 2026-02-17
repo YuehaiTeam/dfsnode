@@ -13,8 +13,8 @@ futures-util = "0.3"
 
 # HTTP server
 axum = "0.8"
-hyper = "1"
-hyper-util = { version = "0.1", features = ["tokio"] }
+hyper = { version = "1", features = ["http1", "http2", "server"] }
+hyper-util = { version = "0.1", features = ["tokio", "http1", "http2", "server-auto"] }
 http = "1"
 http-body = "1"
 http-body-util = "0.1"
@@ -23,7 +23,7 @@ bytes = "1"
 
 # TLS / HTTPS
 tokio-rustls = "0.26"
-rustls = "0.23"
+rustls = { version = "0.23", features = ["ring"] }
 rustls-pemfile = "2"
 
 # HTTP/3 (QUIC)
@@ -33,6 +33,9 @@ h3-quinn = "0.0.10"
 
 # CLI
 clap = { version = "4", features = ["derive"] }
+
+# STUN NAT traversal
+stun-types = "0.1"
 
 # Checksums
 sha1 = "0.10"
@@ -62,6 +65,10 @@ serde_yaml = "0.9"
 
 # UUID for TUS sessions
 uuid = { version = "1", features = ["v4"] }
+
+# HTTP client (webhook)
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+url = "2"
 
 # Error handling
 anyhow = "1"
