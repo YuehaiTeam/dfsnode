@@ -22,6 +22,7 @@ use crate::config::cli::Args;
 use crate::config::{FileConfig, load_config};
 use crate::dav::ChecksumAwareFileSystem;
 use crate::dav::checksum::{ChecksumAlgorithm, ChecksumManager};
+use crate::server::selfsign::RotatingCertResolver;
 use crate::stun::StunConfig;
 use crate::tus::{TusConfig, TusUploadManager};
 use crate::tus::handler::tus_routes;
@@ -159,7 +160,24 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    let app = build_router(&root, &args.prefix, auth, tus_manager);
+    let app = build_router(&root, &args.prefix, auth.clone(), tus_manager);
+
+    // Determine TLS source: file-based or self-signed
+    let needs_tls = args.https_port.is_some() || args.http3_port.is_some();
+    let tls_source: Option<TlsSource> = if needs_tls {
+        if let (Some(cert_path), Some(key_path)) = (&args.cert, &args.key) {
+            let cert = PathBuf::from(cert_path);
+            let key = PathBuf::from(key_path);
+            info!("Using TLS certificate from: {}", cert.display());
+            Some(TlsSource::File { cert, key })
+        } else {
+            info!("No certificate provided — generating self-signed certificate (7-day validity)");
+            let resolver = RotatingCertResolver::new()?;
+            Some(TlsSource::SelfSigned(resolver))
+        }
+    } else {
+        None
+    };
 
     // Resolve STUN config (CLI > config file > none)
     let stun_config: Option<StunConfig> = {
@@ -177,11 +195,10 @@ async fn main() -> anyhow::Result<()> {
         });
 
         if let Some(server_str) = stun_server_str {
-            // Resolve STUN server address (DNS lookup at startup)
             use std::net::ToSocketAddrs;
             let server = server_str
                 .to_socket_addrs()?
-                .find(|a| a.is_ipv4()) // Prefer IPv4 for NAT traversal
+                .find(|a| a.is_ipv4())
                 .or_else(|| server_str.to_socket_addrs().ok()?.next())
                 .ok_or_else(|| anyhow::anyhow!("Failed to resolve STUN server: {server_str}"))?;
             let interval = Duration::from_secs(stun_interval_secs.unwrap_or(20));
@@ -193,6 +210,7 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let mut handles = Vec::new();
+    let mut h3_endpoint: Option<quinn::Endpoint> = None;
 
     // HTTP server
     if let Some(port) = args.http_port {
@@ -207,21 +225,34 @@ async fn main() -> anyhow::Result<()> {
     // HTTPS server
     if let Some(port) = args.https_port {
         let app = app.clone();
-        let cert = PathBuf::from(args.cert.as_ref().unwrap());
-        let key = PathBuf::from(args.key.as_ref().unwrap());
+        let https_config = match tls_source.as_ref().unwrap() {
+            TlsSource::File { cert, key } => server::tls::build_https_config(cert, key)?,
+            TlsSource::SelfSigned(resolver) => {
+                server::selfsign::build_https_config_dynamic(resolver.clone())
+            }
+        };
         handles.push(tokio::spawn(async move {
-            if let Err(e) = server::https::serve(port, &cert, &key, app).await {
+            if let Err(e) = server::https::serve(port, https_config, app).await {
                 tracing::error!("HTTPS server error: {e}");
             }
         }));
     }
 
-    // HTTP/3 server (with optional STUN NAT traversal)
+    // HTTP/3 server (with optional STUN NAT traversal + WebTransport)
     if let Some(port) = args.http3_port {
         let app = app.clone();
-        let cert = PathBuf::from(args.cert.as_ref().unwrap());
-        let key = PathBuf::from(args.key.as_ref().unwrap());
-        let h3_handle = server::http3::spawn(port, &cert, &key, app, stun_config)?;
+        let quic_config = match tls_source.as_ref().unwrap() {
+            TlsSource::File { cert, key } => server::tls::build_quic_config(cert, key)?,
+            TlsSource::SelfSigned(resolver) => {
+                server::selfsign::build_quic_config_self_signed(resolver)?
+            }
+        };
+        let wt_config = server::webtransport::WtConfig {
+            auth: auth.clone(),
+            root: root.clone(),
+            prefix: args.prefix.clone(),
+        };
+        let h3_handle = server::http3::spawn(port, quic_config, app, stun_config, wt_config)?;
 
         // Log public address discovery in background (if STUN enabled)
         // and optionally notify via webhook
@@ -262,11 +293,18 @@ async fn main() -> anyhow::Result<()> {
             }
         });
 
+        h3_endpoint = Some(h3_handle.endpoint);
+
         handles.push(tokio::spawn(async move {
             if let Err(e) = h3_handle.task.await {
                 tracing::error!("HTTP/3 server error: {e}");
             }
         }));
+    }
+
+    // Spawn self-signed cert refresh task if using auto-generated certs
+    if let Some(TlsSource::SelfSigned(resolver)) = tls_source {
+        server::selfsign::spawn_refresh_task(resolver, h3_endpoint);
     }
 
     info!("All servers started. Press Ctrl+C to stop.");
@@ -279,14 +317,19 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+enum TlsSource {
+    File { cert: PathBuf, key: PathBuf },
+    SelfSigned(Arc<RotatingCertResolver>),
+}
+
 /// Parse a webhook URL, extracting optional basic auth credentials.
 ///
 /// Supports URLs like `https://user:pass@host/path` — the credentials are
 /// stripped from the URL and returned separately for use with reqwest's
 /// `.basic_auth()`.
-fn build_webhook_client(
-    raw_url: &str,
-) -> anyhow::Result<(reqwest::Client, String, Option<(String, String)>)> {
+type WebhookConfig = (reqwest::Client, String, Option<(String, String)>);
+
+fn build_webhook_client(raw_url: &str) -> anyhow::Result<WebhookConfig> {
     let parsed = url::Url::parse(raw_url)
         .map_err(|e| anyhow::anyhow!("Invalid webhook URL: {e}"))?;
 

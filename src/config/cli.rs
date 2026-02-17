@@ -23,11 +23,14 @@ pub struct Args {
     #[arg(long)]
     pub http3_port: Option<u16>,
 
-    /// Path to TLS certificate file (PEM format, required for HTTPS/HTTP3)
+    /// Path to TLS certificate file (PEM format).
+    /// If omitted when HTTPS/HTTP3 is enabled, a self-signed certificate is
+    /// auto-generated and periodically renewed.
     #[arg(long)]
     pub cert: Option<String>,
 
-    /// Path to TLS private key file (PEM format, required for HTTPS/HTTP3)
+    /// Path to TLS private key file (PEM format).
+    /// Must be specified together with --cert.
     #[arg(long)]
     pub key: Option<String>,
 
@@ -85,12 +88,9 @@ impl Args {
             );
         }
 
-        if (self.https_port.is_some() || self.http3_port.is_some())
-            && (self.cert.is_none() || self.key.is_none())
-        {
-            anyhow::bail!(
-                "--cert and --key are required when --https-port or --http3-port is specified"
-            );
+        // cert and key must both be set or both unset
+        if self.cert.is_some() != self.key.is_some() {
+            anyhow::bail!("--cert and --key must be specified together");
         }
 
         let root = std::path::Path::new(&self.root);

@@ -39,6 +39,61 @@ pub struct AuthConfig {
     prefix: String,
 }
 
+impl AuthConfig {
+    /// Find the effective sign rule for a DAV-relative path.
+    ///
+    /// Returns `(Some(rule), true)` if a per-path override matched,
+    /// `(Some(global_key_rule), false)` if the global key applies,
+    /// or `(None, false)` if no signing rule applies.
+    /// Whether basic auth credentials are configured.
+    pub fn has_basic_auth(&self) -> bool {
+        self.basic.is_some()
+    }
+
+    /// Verify a GET-like download request without HTTP context.
+    ///
+    /// Used by WebTransport and other non-HTTP channels that cannot carry
+    /// Basic Auth headers. Mirrors the auth middleware GET logic:
+    ///
+    /// 1. Per-path override → `Open` = allow, `Key` = verify signature
+    /// 2. Global sign key → verify signature
+    /// 3. No sign rule → if basic auth is also not configured, allow (open access);
+    ///    otherwise deny (caller cannot provide basic auth)
+    pub fn verify_signature(&self, uri_path: &str, sign_param: Option<&str>) -> bool {
+        let dav_path = strip_prefix_path(uri_path, &self.prefix);
+        let (rule, _has_override) = self.find_sign_rule(dav_path);
+
+        match rule {
+            Some(SignRule::Open) => true,
+            Some(SignRule::Key(verifier)) => {
+                let Some(sign_str) = sign_param else {
+                    return false;
+                };
+                verifier.verify(uri_path, sign_str, None).is_ok()
+            }
+            None => !self.has_basic_auth(),
+        }
+    }
+
+    pub fn find_sign_rule(&self, dav_path: &str) -> (Option<SignRule>, bool) {
+        // Check per-path overrides first (already sorted longest-prefix-first)
+        if let Some((_, rule)) = self
+            .sign_overrides
+            .iter()
+            .find(|(prefix, _)| dav_path.starts_with(prefix.as_str()))
+        {
+            return (Some(rule.clone()), true);
+        }
+
+        // Fall back to global
+        if let Some(ref global) = self.sign_global {
+            return (Some(SignRule::Key(global.clone())), false);
+        }
+
+        (None, false)
+    }
+}
+
 /// Unified auth middleware:
 /// - GET requests: check per-path overrides first, then global signature, then basic auth
 /// - Non-GET: basic auth only
@@ -144,7 +199,7 @@ fn check_basic_auth(req: &Request, creds: &BasicCredentials) -> bool {
 }
 
 /// Extract the `$` query parameter value from a query string.
-fn extract_sign_param(query: &str) -> Option<String> {
+pub fn extract_sign_param(query: &str) -> Option<String> {
     for part in query.split('&') {
         // Handle both `$=value` and `%24=value` (URL-encoded `$`)
         if let Some(value) = part.strip_prefix("$=").or_else(|| part.strip_prefix("%24="))

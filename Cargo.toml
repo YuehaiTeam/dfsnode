@@ -26,16 +26,19 @@ tokio-rustls = "0.26"
 rustls = { version = "0.23", features = ["ring"] }
 rustls-pemfile = "2"
 
-# HTTP/3 (QUIC)
+# HTTP/3 (QUIC) + WebTransport
 quinn = "0.11"
-h3 = "0.0.8"
-h3-quinn = "0.0.10"
+h3 = { git = "https://github.com/hyperium/h3", branch = "master" }
+h3-quinn = { git = "https://github.com/hyperium/h3", branch = "master", features = ["datagram"] }
+h3-webtransport = { git = "https://github.com/hyperium/h3", branch = "master" }
+h3-datagram = { git = "https://github.com/hyperium/h3", branch = "master" }
 
 # CLI
 clap = { version = "4", features = ["derive"] }
 
 # STUN NAT traversal
 stun-types = "0.1"
+time = "0.3"
 
 # Checksums
 sha1 = "0.10"
@@ -69,6 +72,10 @@ uuid = { version = "1", features = ["v4"] }
 # HTTP client (webhook)
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 url = "2"
+
+# Self-signed certificate generation
+rcgen = { version = "0.13", features = ["ring"] }
+arc-swap = "1"
 
 # Error handling
 anyhow = "1"

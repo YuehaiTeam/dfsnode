@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::sync::Arc;
 
 use axum::Router;
 use tokio::net::TcpListener;
@@ -6,19 +6,15 @@ use tokio_rustls::TlsAcceptor;
 use tower::Service;
 use tracing::info;
 
-use crate::server::tls;
-
-/// Start an HTTPS server on the given port.
+/// Start an HTTPS server with a pre-built rustls ServerConfig.
 pub async fn serve(
     port: u16,
-    cert_path: &Path,
-    key_path: &Path,
+    rustls_config: Arc<rustls::ServerConfig>,
     app: Router,
 ) -> anyhow::Result<()> {
-    let rustls_config = tls::build_https_config(cert_path, key_path)?;
     let tls_acceptor = TlsAcceptor::from(rustls_config);
 
-    let addr = format!("0.0.0.0:{port}");
+    let addr = format!("[::]:{port}");
     let listener = TcpListener::bind(&addr).await?;
     info!("HTTPS server listening on https://{addr}");
 
