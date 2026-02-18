@@ -11,6 +11,7 @@
 
 pub mod protocol;
 
+use std::collections::HashSet;
 use std::fmt;
 use std::io;
 use std::net::SocketAddr;
@@ -24,11 +25,41 @@ use quinn::{AsyncUdpSocket, UdpPoller};
 use tokio::sync::watch;
 use tracing::{debug, info, trace, warn};
 
+/// Normalize a [`SocketAddr`] by unwrapping IPv4-mapped IPv6 addresses
+/// (`::ffff:x.x.x.x`) back to plain IPv4.  On dual-stack sockets (Windows),
+/// the OS reports IPv4 peers as `::ffff:` — this breaks direct equality
+/// checks against stored IPv4 `SocketAddr` values.
+pub fn normalize_addr(addr: SocketAddr) -> SocketAddr {
+    match addr {
+        SocketAddr::V6(v6) => {
+            if let Some(ipv4) = v6.ip().to_ipv4_mapped() {
+                SocketAddr::new(std::net::IpAddr::V4(ipv4), v6.port())
+            } else {
+                addr
+            }
+        }
+        other => other,
+    }
+}
+
+/// Convert an IPv4 `SocketAddr` to its IPv4-mapped IPv6 form so it can be
+/// used with a dual-stack `[::]` socket on Windows.  IPv6 addresses pass
+/// through unchanged.
+fn to_v6_mapped(addr: SocketAddr) -> SocketAddr {
+    match addr {
+        SocketAddr::V4(v4) => SocketAddr::new(
+            std::net::IpAddr::V6(v4.ip().to_ipv6_mapped()),
+            v4.port(),
+        ),
+        v6 => v6,
+    }
+}
+
 /// Runtime configuration for STUN NAT traversal.
 #[derive(Debug, Clone)]
 pub struct StunConfig {
-    /// Resolved STUN server socket address.
-    pub server: SocketAddr,
+    /// Resolved STUN server socket addresses (all IPs from all servers).
+    pub servers: Vec<SocketAddr>,
     /// Interval between STUN keepalive requests.
     pub interval: Duration,
 }
@@ -37,11 +68,11 @@ pub struct StunConfig {
 pub struct StunSetup {
     /// The demux socket to hand to Quinn (wraps the original socket).
     pub socket: Arc<dyn AsyncUdpSocket>,
-    /// Receiver for the discovered public address.
-    pub public_addr_rx: watch::Receiver<Option<SocketAddr>>,
+    /// Receiver for discovered public addresses (accumulated set).
+    pub public_addr_rx: watch::Receiver<HashSet<SocketAddr>>,
     /// The cloned raw UDP socket for the keepalive task.
     pub keepalive_socket: std::net::UdpSocket,
-    /// STUN configuration (server + interval).
+    /// STUN configuration (servers + interval).
     pub config: StunConfig,
 }
 
@@ -66,12 +97,15 @@ pub fn setup_stun_socket(
     // Wrap into Quinn's async socket
     let inner = runtime.wrap_udp_socket(raw_socket)?;
 
-    // Create watch channel for public address discovery
-    let (pub_addr_tx, pub_addr_rx) = watch::channel(None);
+    // Create watch channel for public address discovery (set of addresses)
+    let (pub_addr_tx, pub_addr_rx) = watch::channel(HashSet::new());
+
+    // Build the set of normalized STUN server addresses for fast lookup
+    let stun_servers: HashSet<SocketAddr> = config.servers.iter().copied().map(normalize_addr).collect();
 
     let demux = Arc::new(StunDemuxSocket {
         inner,
-        stun_server: config.server,
+        stun_servers,
         public_addr_tx: pub_addr_tx,
         rtc_packet_tx,
     });
@@ -86,18 +120,24 @@ pub fn setup_stun_socket(
 
 /// Spawns the STUN keepalive background task.
 ///
-/// Periodically sends STUN Binding Requests to the configured STUN server
+/// Periodically sends STUN Binding Requests to ALL configured STUN servers
 /// using the cloned raw UDP socket (same local port as Quinn). Also fires
-/// one request immediately on startup so we get the public address ASAP.
+/// requests immediately on startup so we get the public addresses ASAP.
 pub fn spawn_stun_keepalive(
     raw_socket: std::net::UdpSocket,
     config: StunConfig,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let stun_server = config.server;
+        let servers = config.servers;
         let interval = config.interval;
 
-        info!("STUN keepalive started → {stun_server} every {interval:?}");
+        info!(
+            "STUN keepalive started → {} server(s) every {interval:?}",
+            servers.len()
+        );
+        for s in &servers {
+            info!("  STUN target: {s}");
+        }
 
         // Send immediately on startup, then at intervals
         let mut timer = tokio::time::interval(interval);
@@ -105,13 +145,18 @@ pub fn spawn_stun_keepalive(
         loop {
             timer.tick().await;
 
-            let req = protocol::build_binding_request();
-            match raw_socket.send_to(&req, stun_server) {
-                Ok(n) => debug!("STUN Binding Request sent to {stun_server} ({n} bytes)"),
-                Err(e) => {
-                    // WouldBlock is expected on non-blocking sockets under load
-                    if e.kind() != io::ErrorKind::WouldBlock {
-                        warn!("Failed to send STUN request: {e}");
+            for &stun_server in &servers {
+                let req = protocol::build_binding_request();
+                // On dual-stack sockets ([::]), must use IPv4-mapped IPv6
+                // addresses when sending to IPv4 targets (Windows requirement).
+                let dest = to_v6_mapped(stun_server);
+                match raw_socket.send_to(&req, dest) {
+                    Ok(n) => debug!("STUN Binding Request sent to {stun_server} ({n} bytes)"),
+                    Err(e) => {
+                        // WouldBlock is expected on non-blocking sockets under load
+                        if e.kind() != io::ErrorKind::WouldBlock {
+                            warn!("Failed to send STUN request to {stun_server}: {e}");
+                        }
                     }
                 }
             }
@@ -124,7 +169,7 @@ pub fn spawn_stun_keepalive(
 // ─────────────────────────────────────────────────────────────
 
 /// A wrapper around Quinn's `AsyncUdpSocket` that transparently intercepts
-/// STUN Binding Responses from the configured STUN server before they reach
+/// STUN Binding Responses from the configured STUN servers before they reach
 /// Quinn's QUIC stack.
 ///
 /// When WebRTC is enabled, also routes:
@@ -133,8 +178,8 @@ pub fn spawn_stun_keepalive(
 /// - QUIC packets (first byte 64–255) → Quinn
 struct StunDemuxSocket {
     inner: Arc<dyn AsyncUdpSocket>,
-    stun_server: SocketAddr,
-    public_addr_tx: watch::Sender<Option<SocketAddr>>,
+    stun_servers: HashSet<SocketAddr>,
+    public_addr_tx: watch::Sender<HashSet<SocketAddr>>,
     /// Channel to forward ICE STUN and DTLS packets to the RtcManager.
     /// None when WebRTC is disabled.
     rtc_packet_tx: Option<tokio::sync::mpsc::Sender<(Vec<u8>, SocketAddr)>>,
@@ -143,18 +188,18 @@ struct StunDemuxSocket {
 impl fmt::Debug for StunDemuxSocket {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("StunDemuxSocket")
-            .field("stun_server", &self.stun_server)
+            .field("stun_servers", &self.stun_servers)
             .finish()
     }
 }
 
 impl StunDemuxSocket {
-    /// Check if a received datagram is a STUN response from our server and
-    /// handle it. Returns `true` if the packet was consumed (should NOT be
+    /// Check if a received datagram is a STUN response from one of our servers
+    /// and handle it. Returns `true` if the packet was consumed (should NOT be
     /// forwarded to Quinn).
     fn try_handle_stun(&self, data: &[u8], source: SocketAddr) -> bool {
         // Fast path: wrong source or clearly not STUN
-        if source != self.stun_server {
+        if !self.stun_servers.contains(&normalize_addr(source)) {
             return false;
         }
         if !protocol::could_be_stun(data) {
@@ -163,14 +208,13 @@ impl StunDemuxSocket {
 
         // Attempt full parse
         if let Some(public_addr) = protocol::parse_binding_response(data) {
-            // Only log on change (watch::Sender::send_if_modified)
+            // Add to the set of discovered public addresses
             self.public_addr_tx.send_if_modified(|current| {
-                if *current != Some(public_addr) {
+                if current.insert(public_addr) {
                     info!("STUN discovered public address: {public_addr}");
-                    *current = Some(public_addr);
                     true
                 } else {
-                    trace!("STUN public address unchanged: {public_addr}");
+                    trace!("STUN public address already known: {public_addr}");
                     false
                 }
             });
@@ -192,8 +236,8 @@ impl StunDemuxSocket {
 
         // STUN range: first byte 0–3
         if first_byte <= 3 {
-            // From our STUN server → handle as NAT traversal response
-            if source == self.stun_server {
+            // From one of our STUN servers → handle as NAT traversal response
+            if self.stun_servers.contains(&normalize_addr(source)) {
                 return self.try_handle_stun(data, source);
             }
             // From other source → ICE connectivity check → route to RtcManager

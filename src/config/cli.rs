@@ -62,12 +62,12 @@ pub struct Args {
     #[arg(long)]
     pub config: Option<String>,
 
-    /// STUN server address for NAT traversal (e.g. "stun.l.google.com:19302").
-    /// Only meaningful with --http3-port. When set, the HTTP/3 server will
-    /// periodically send STUN Binding Requests to discover its public UDP
-    /// address and keep the NAT mapping alive.
-    #[arg(long)]
-    pub stun_server: Option<String>,
+    /// STUN server address(es) for NAT traversal (e.g. "stun.l.google.com:19302").
+    /// Can be specified multiple times. Only meaningful with --http3-port.
+    /// When set, the HTTP/3 server will periodically send STUN Binding Requests
+    /// to ALL resolved IPs to discover public UDP addresses and keep NAT mappings alive.
+    #[arg(long, action = clap::ArgAction::Append)]
+    pub stun_server: Vec<String>,
 
     /// Interval in seconds between STUN keepalive requests (default: 20).
     #[arg(long)]
@@ -128,7 +128,7 @@ impl Args {
         }
 
         // --stun-server requires --http3-port
-        if self.stun_server.is_some() && self.http3_port.is_none() {
+        if !self.stun_server.is_empty() && self.http3_port.is_none() {
             anyhow::bail!("--stun-server requires --http3-port to be specified");
         }
 
@@ -142,7 +142,7 @@ impl Args {
             if self.http3_port.is_none() {
                 anyhow::bail!("--enable-rtc requires --http3-port to be specified");
             }
-            if self.stun_server.is_none() {
+            if self.stun_server.is_empty() {
                 anyhow::bail!("--enable-rtc requires --stun-server for public address discovery");
             }
         }

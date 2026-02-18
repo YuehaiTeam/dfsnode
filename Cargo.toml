@@ -62,6 +62,7 @@ hex = "0.4"
 
 # Auth
 base64 = "0.22"
+jsonwebtoken = "9"
 
 # Config file
 serde_yaml = "0.9"
@@ -80,8 +81,19 @@ arc-swap = "1"
 # WebRTC DataChannel (Sans-I/O)
 str0m = { version = "0.15", default-features = true }
 
+# Dual-stack socket creation
+socket2 = "0.5"
+
 # Error handling
 anyhow = "1"
 
+# Prometheus metrics
+prometheus = { version = "0.13", features = ["process"] }
+lazy_static = "1.5"
+
 [profile.dev]
 debug = "line-tables-only"
+
+[patch.crates-io]
+# Use local fork of sctp-proto with increased buffer size for high-bandwidth WAN links
+sctp-proto = { path = ".cache/sctp-proto" }

@@ -48,10 +48,26 @@ pub struct TusFileConfig {
 /// STUN NAT traversal configuration from the config file.
 #[derive(Deserialize, Debug, Clone)]
 pub struct StunFileConfig {
-    /// STUN server address, e.g. "stun.l.google.com:19302"
+    /// Single STUN server address (backward compat), e.g. "stun.l.google.com:19302"
     pub server: Option<String>,
+    /// Multiple STUN server addresses, e.g. ["stun.miwifi.com:3478", "stun.l.google.com:19302"]
+    pub servers: Option<Vec<String>>,
     /// Keepalive interval in seconds (default: 20)
     pub interval_secs: Option<u64>,
+}
+
+impl StunFileConfig {
+    /// Merge `server` (singular) and `servers` (plural) into a single list.
+    /// `servers` takes precedence; if absent, `server` is treated as a single-element list.
+    pub fn all_servers(&self) -> Vec<String> {
+        if let Some(ref servers) = self.servers {
+            servers.clone()
+        } else if let Some(ref server) = self.server {
+            vec![server.clone()]
+        } else {
+            vec![]
+        }
+    }
 }
 
 /// Load and validate a YAML configuration file.

@@ -1,9 +1,10 @@
 use std::path::PathBuf;
 
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{info, warn};
 
 use crate::auth::{AuthConfig, extract_sign_param};
+use crate::metrics::MetricsGuard;
 
 /// Configuration needed for WebTransport file download.
 #[derive(Clone)]
@@ -23,6 +24,8 @@ pub async fn handle_webtransport(
     h3_conn: h3::server::Connection<h3_quinn::Connection, bytes::Bytes>,
     wt_config: &WtConfig,
 ) -> anyhow::Result<()> {
+    let mut guard = MetricsGuard::new("wt");
+
     let uri_path = req.uri().path().to_owned();
     let query = req.uri().query().unwrap_or("").to_owned();
 
@@ -72,13 +75,30 @@ pub async fn handle_webtransport(
     );
 
     let mut file = tokio::fs::File::open(&file_path).await?;
-    let bytes_sent = tokio::io::copy(&mut file, &mut uni_stream).await?;
+    let file_size = file.metadata().await?.len();
 
-    // Shutdown the stream to signal completion
+    // Send 8-byte big-endian file size header before file data
+    uni_stream.write_all(&file_size.to_be_bytes()).await?;
+    guard.add_bytes(8); // Count the 8-byte file size header
+
+    // Stream file data in chunks, tracking bytes accurately even on error
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = file.read(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        uni_stream.write_all(&buf[..n]).await?;
+        guard.add_bytes(n as u64);
+    }
+
+    // Shutdown the stream to signal completion (sends QUIC FIN)
     uni_stream.shutdown().await?;
-    info!("WebTransport: file sent ({bytes_sent} bytes), closing session");
+    info!("WebTransport: file sent ({} bytes), closing session", guard.bytes_sent_so_far());
 
-    // Drop session to close the connection
-    drop(session);
+    // Release the stream, then wait for the client to finish reading
+    // before dropping session (which closes the QUIC connection).
+    drop(uni_stream);
+    let _ = session.accept_uni().await;
     Ok(())
 }

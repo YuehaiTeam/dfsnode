@@ -18,6 +18,16 @@ pub(crate) struct BasicCredentials {
     password: String,
 }
 
+impl BasicCredentials {
+    pub(crate) fn username(&self) -> &str {
+        &self.username
+    }
+
+    pub(crate) fn password(&self) -> &str {
+        &self.password
+    }
+}
+
 /// Per-path signature rule.
 #[derive(Clone)]
 pub(crate) enum SignRule {
@@ -50,6 +60,16 @@ impl AuthConfig {
     /// Whether basic auth credentials are configured.
     pub fn has_basic_auth(&self) -> bool {
         self.basic.is_some()
+    }
+
+    /// Get the basic auth password (used as JWT secret for MinIO-compatible metrics).
+    pub fn basic_password(&self) -> Option<&str> {
+        self.basic.as_ref().map(|b| b.password())
+    }
+
+    /// Get the basic auth username.
+    pub fn basic_username(&self) -> Option<&str> {
+        self.basic.as_ref().map(|b| b.username())
     }
 
     /// Verify a GET-like download request without HTTP context.
@@ -96,31 +116,58 @@ impl AuthConfig {
     }
 }
 
+/// Append CORS headers to a response.
+fn cors_headers(resp: &mut Response) {
+    let headers = resp.headers_mut();
+    headers.insert(
+        http::header::ACCESS_CONTROL_ALLOW_ORIGIN,
+        http::HeaderValue::from_static("*"),
+    );
+    headers.insert(
+        http::header::ACCESS_CONTROL_ALLOW_METHODS,
+        http::HeaderValue::from_static("GET, HEAD, PUT, DELETE, PROPFIND, LOCK, OPTIONS, PATCH"),
+    );
+    headers.insert(
+        http::header::ACCESS_CONTROL_ALLOW_HEADERS,
+        http::HeaderValue::from_static("Content-Type, Authorization, Depth, Overwrite, Destination"),
+    );
+    headers.insert(
+        http::header::ACCESS_CONTROL_MAX_AGE,
+        http::HeaderValue::from_static("86400"),
+    );
+}
+
 /// Unified auth middleware:
+/// - CORS: handle OPTIONS preflight and add CORS headers to all responses
 /// - --no-tcp-download: block GET downloads via H1/H2 (non-management paths)
-/// - GET requests: check per-path overrides first, then global signature, then basic auth
-/// - Non-GET: basic auth only
+/// - GET/PROPFIND requests: check per-path overrides first, then global signature, then basic auth
+/// - Other methods: basic auth only
 pub async fn auth_middleware(
     config: AuthConfig,
     req: Request,
     next: Next,
 ) -> Response {
-    // Block H1/H2 GET downloads when --no-tcp-download is active.
-    // Management paths (/-/) and non-GET methods are always allowed.
-    // H3 requests never reach this middleware (they go through Quinn, not TCP listener).
-    if config.no_tcp_download
-        && req.method() == http::Method::GET
-        && !req.uri().path().starts_with("/-/")
-    {
-        return (
-            StatusCode::METHOD_NOT_ALLOWED,
-            [(http::header::ALLOW, "PROPFIND, LOCK, OPTIONS, HEAD")],
-            "TCP downloads disabled. Use H3, WebTransport, or WebRTC.",
-        )
-            .into_response();
+    // OPTIONS: skip auth but let DavHandler respond (preserves WebDAV
+    // headers like allow, dav, ms-author-via).  CORS headers are added
+    // uniformly below.
+    let mut resp = if req.method() == http::Method::OPTIONS {
+        next.run(req).await
+    } else {
+        auth_inner(config, req, next).await
+    };
+    cors_headers(&mut resp);
+    resp
+}
+
+/// Core auth logic, separated so the outer function can uniformly apply CORS
+/// headers to the response.
+async fn auth_inner(config: AuthConfig, req: Request, next: Next) -> Response {
+    // /minio/ paths handle their own auth (JWT), skip here
+    if req.uri().path().starts_with("/minio/") {
+        return next.run(req).await;
     }
 
-    if req.method() == http::Method::GET {
+    if req.method() == http::Method::GET || req.method() == http::Method::from_bytes(b"PROPFIND").unwrap() {
         let uri_path = req.uri().path();
 
         // Compute the DAV-relative path by stripping the prefix

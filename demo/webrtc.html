@@ -1,0 +1,558 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>dfsnode WebRTC DataChannel Test</title>
+    <style>
+        :root {
+            --bg-color: #121212;
+            --surface-color: #1e1e1e;
+            --primary-color: #3b82f6;
+            --primary-hover: #2563eb;
+            --text-color: #e5e5e5;
+            --text-secondary: #a3a3a3;
+            --border-color: #333;
+            --success-color: #22c55e;
+            --error-color: #ef4444;
+            --warning-color: #f59e0b;
+            --info-color: #3b82f6;
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            background-color: var(--bg-color);
+            color: var(--text-color);
+            line-height: 1.6;
+            padding: 20px;
+            max-width: 800px;
+            margin: 0 auto;
+        }
+
+        header {
+            margin-bottom: 30px;
+            border-bottom: 1px solid var(--border-color);
+            padding-bottom: 20px;
+        }
+
+        h1 {
+            font-size: 1.5rem;
+            font-weight: 600;
+            color: var(--primary-color);
+        }
+
+        .card {
+            background-color: var(--surface-color);
+            border-radius: 8px;
+            padding: 20px;
+            margin-bottom: 20px;
+            border: 1px solid var(--border-color);
+        }
+
+        .form-group {
+            margin-bottom: 15px;
+        }
+
+        label {
+            display: block;
+            margin-bottom: 5px;
+            color: var(--text-secondary);
+            font-size: 0.9rem;
+        }
+
+        input {
+            width: 100%;
+            padding: 10px;
+            background-color: #2d2d2d;
+            border: 1px solid var(--border-color);
+            border-radius: 4px;
+            color: var(--text-color);
+            font-size: 1rem;
+            transition: border-color 0.2s;
+        }
+
+        input:focus {
+            outline: none;
+            border-color: var(--primary-color);
+        }
+
+        .row {
+            display: flex;
+            gap: 15px;
+        }
+
+        .col {
+            flex: 1;
+        }
+
+        button {
+            background-color: var(--primary-color);
+            color: white;
+            border: none;
+            padding: 12px 24px;
+            border-radius: 4px;
+            font-size: 1rem;
+            font-weight: 500;
+            cursor: pointer;
+            width: 100%;
+            transition: background-color 0.2s;
+        }
+
+        button:hover {
+            background-color: var(--primary-hover);
+        }
+
+        button:disabled {
+            background-color: #4b5563;
+            cursor: not-allowed;
+        }
+
+        #log-area {
+            background-color: #0d0d0d;
+            border: 1px solid var(--border-color);
+            border-radius: 4px;
+            padding: 15px;
+            height: 300px;
+            overflow-y: auto;
+            font-family: 'Consolas', 'Monaco', monospace;
+            font-size: 0.85rem;
+            margin-bottom: 20px;
+        }
+
+        .log-entry {
+            margin-bottom: 4px;
+            word-break: break-all;
+        }
+
+        .log-time {
+            color: var(--text-secondary);
+            margin-right: 8px;
+            font-size: 0.75rem;
+        }
+
+        .log-info { color: var(--text-secondary); }
+        .log-success { color: var(--success-color); }
+        .log-error { color: var(--error-color); }
+        .log-warn { color: var(--warning-color); }
+        .log-data { color: var(--info-color); }
+
+        .progress-container {
+            display: none;
+            margin-top: 20px;
+        }
+
+        .progress-bar-bg {
+            background-color: #2d2d2d;
+            height: 8px;
+            border-radius: 4px;
+            overflow: hidden;
+            margin: 10px 0;
+        }
+
+        .progress-bar-fill {
+            background-color: var(--success-color);
+            height: 100%;
+            width: 0%;
+            transition: width 0.1s linear;
+        }
+
+        .stats-row {
+            display: flex;
+            justify-content: space-between;
+            font-size: 0.9rem;
+            color: var(--text-secondary);
+        }
+
+        #download-link {
+            display: inline-block;
+            margin-top: 15px;
+            color: var(--primary-color);
+            text-decoration: none;
+            font-weight: 500;
+        }
+
+        #download-link:hover {
+            text-decoration: underline;
+        }
+
+        @media (max-width: 600px) {
+            .row {
+                flex-direction: column;
+                gap: 0;
+            }
+            .form-group {
+                margin-bottom: 10px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <h1>dfsnode WebRTC DataChannel Test</h1>
+    </header>
+
+    <div class="card">
+        <div class="form-group">
+            <label for="server-url">Server URL</label>
+            <input type="text" id="server-url" value="http://localhost:3000" placeholder="http://localhost:3000">
+        </div>
+        <div class="form-group">
+            <label for="file-path">File Path</label>
+            <input type="text" id="file-path" value="/test.txt" placeholder="/path/to/file">
+        </div>
+        <div class="row">
+            <div class="col form-group">
+                <label for="username">Username (Optional)</label>
+                <input type="text" id="username" placeholder="user">
+            </div>
+            <div class="col form-group">
+                <label for="password">Password (Optional)</label>
+                <input type="password" id="password" placeholder="pass">
+            </div>
+        </div>
+        <button id="start-btn">Download via WebRTC</button>
+    </div>
+
+    <div id="progress-section" class="card progress-container">
+        <div class="stats-row">
+            <span id="file-name">filename.ext</span>
+            <span id="file-size">0 B</span>
+        </div>
+        <div class="progress-bar-bg">
+            <div id="progress-fill" class="progress-bar-fill"></div>
+        </div>
+        <div class="stats-row">
+            <span id="transfer-speed">0 KB/s</span>
+            <span id="transfer-percent">0%</span>
+        </div>
+        <a id="download-link" href="#" download style="display: none;">Save File to Disk</a>
+    </div>
+
+    <div id="log-area"></div>
+
+    <script>
+        // DOM Elements
+        const startBtn = document.getElementById('start-btn');
+        const logArea = document.getElementById('log-area');
+        const progressSection = document.getElementById('progress-section');
+        const progressFill = document.getElementById('progress-fill');
+        const fileNameEl = document.getElementById('file-name');
+        const fileSizeEl = document.getElementById('file-size');
+        const speedEl = document.getElementById('transfer-speed');
+        const percentEl = document.getElementById('transfer-percent');
+        const downloadLink = document.getElementById('download-link');
+
+        // State
+        let pc = null;
+        let dc = null;
+        let chunks = [];
+        let metadata = null;
+        let startTime = 0;
+        let receivedBytes = 0;
+        let lastUpdate = 0;
+
+        // Configuration
+        const CHUNK_SIZE = 16384; // 16KB standard chunk size
+
+        function log(msg, type = 'info') {
+            const div = document.createElement('div');
+            div.className = `log-entry log-${type}`;
+            const time = new Date().toLocaleTimeString();
+            div.innerHTML = `<span class="log-time">[${time}]</span> ${msg}`;
+            logArea.appendChild(div);
+            logArea.scrollTop = logArea.scrollHeight;
+            console.log(`[${type.toUpperCase()}] ${msg}`);
+        }
+
+        function formatSize(bytes) {
+            if (bytes === 0) return '0 B';
+            const k = 1024;
+            const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
+            const i = Math.floor(Math.log(bytes) / Math.log(k));
+            return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+        }
+
+        function updateProgress(received, total) {
+            const now = Date.now();
+            const percent = Math.min(100, (received / total) * 100).toFixed(1);
+            
+            progressFill.style.width = `${percent}%`;
+            percentEl.textContent = `${percent}%`;
+            
+            // Update speed every 500ms
+            if (now - lastUpdate > 500) {
+                const duration = (now - startTime) / 1000;
+                const speed = received / duration; // bytes per second
+                speedEl.textContent = `${formatSize(speed)}/s`;
+                lastUpdate = now;
+            }
+        }
+
+        function resetState() {
+            if (pc) {
+                pc.close();
+                pc = null;
+            }
+            if (dc) {
+                dc.close();
+                dc = null;
+            }
+            chunks = [];
+            metadata = null;
+            receivedBytes = 0;
+            startTime = 0;
+            
+            progressSection.style.display = 'none';
+            downloadLink.style.display = 'none';
+            progressFill.style.width = '0%';
+            startBtn.disabled = false;
+        }
+
+        async function startDownload() {
+            const serverUrl = document.getElementById('server-url').value.replace(/\/$/, '');
+            const filePath = document.getElementById('file-path').value;
+            const username = document.getElementById('username').value;
+            const password = document.getElementById('password').value;
+
+            if (!serverUrl || !filePath) {
+                log('Please provide Server URL and File Path', 'error');
+                return;
+            }
+
+            resetState();
+            startBtn.disabled = true;
+            log('Starting WebRTC connection sequence...', 'info');
+
+            try {
+                // Step 1: Create PeerConnection
+                pc = new RTCPeerConnection({
+                    iceServers: [
+                        { urls: 'stun:stun.l.google.com:19302' },
+                        { urls: 'stun:stun.miwifi.com:3478' },
+                    ]
+                });
+
+                pc.oniceconnectionstatechange = () => {
+                    log(`ICE Connection State: ${pc.iceConnectionState}`, 'info');
+                };
+
+                // Step 2: Create DataChannel
+                dc = pc.createDataChannel("file-transfer", {
+                    ordered: true
+                });
+                
+                setupDataChannel(dc);
+
+                // Step 3: Gather ICE Candidates
+                const candidates = [];
+                pc.onicecandidate = (e) => {
+                    if (e.candidate) {
+                        candidates.push(e.candidate);
+                        log(`Gathered ICE candidate: ${e.candidate.candidate}`, 'info');
+                    } else {
+                        log('ICE gathering complete', 'success');
+                    }
+                };
+
+                // Step 4: Create Offer
+                log('Creating offer...', 'info');
+                const offer = await pc.createOffer();
+                await pc.setLocalDescription(offer);
+
+                log('Waiting for ICE gathering to complete...', 'info');
+                await waitForIceGathering(pc);
+
+                // Step 5: Send LOCK request
+                const lockUrl = `${serverUrl}${filePath}`;
+                log(`Sending LOCK request to ${lockUrl}...`, 'info');
+
+                const headers = {
+                    "Content-Type": "application/json"
+                };
+
+                if (username && password) {
+                    headers["Authorization"] = "Basic " + btoa(`${username}:${password}`);
+                }
+
+                const payload = {
+                    sdp: pc.localDescription.sdp,
+                    candidates: candidates
+                };
+
+                const response = await fetch(lockUrl, {
+                    method: "LOCK",
+                    headers: headers,
+                    body: JSON.stringify(payload)
+                });
+
+                if (!response.ok) {
+                    throw new Error(`Server returned ${response.status} ${response.statusText}`);
+                }
+
+                const responseData = await response.json();
+                log('Received server answer', 'success');
+
+                // Step 6: Set Remote Description
+                await pc.setRemoteDescription({
+                    type: "answer",
+                    sdp: responseData.sdp
+                });
+
+                // Add server candidates
+                if (responseData.candidates && Array.isArray(responseData.candidates)) {
+                    log(`Adding ${responseData.candidates.length} server candidates...`, 'info');
+                    for (const c of responseData.candidates) {
+                        // Handle both raw string candidates and object format if server sends that
+                        const candidateInit = typeof c === 'string' 
+                            ? { candidate: c, sdpMid: "0", sdpMLineIndex: 0 } 
+                            : c;
+                        await pc.addIceCandidate(candidateInit);
+                    }
+                }
+
+            } catch (err) {
+                log(`Error: ${err.message}`, 'error');
+                console.error(err);
+                startBtn.disabled = false;
+            }
+        }
+
+        function setupDataChannel(channel) {
+            channel.binaryType = "arraybuffer";
+
+            channel.onopen = () => {
+                log('DataChannel OPEN', 'success');
+                startTime = Date.now();
+                lastUpdate = startTime;
+            };
+
+            channel.onmessage = (e) => {
+                const data = e.data;
+
+                // First message is metadata (JSON string)
+                if (!metadata) {
+                    try {
+                        // Even if binaryType is arraybuffer, strings sent via send() arrive as strings
+                        // But if server sends bytes that happen to be JSON, we might need to decode
+                        let jsonStr;
+                        if (typeof data === 'string') {
+                            jsonStr = data;
+                        } else {
+                            jsonStr = new TextDecoder().decode(data);
+                        }
+                        
+                        // Try to parse as JSON
+                        try {
+                            metadata = JSON.parse(jsonStr);
+                            log(`Receiving file: ${metadata.filename} (${formatSize(metadata.size)})`, 'data');
+                            
+                            // Initialize UI
+                            fileNameEl.textContent = metadata.filename;
+                            fileSizeEl.textContent = formatSize(metadata.size);
+                            progressSection.style.display = 'block';
+                            
+                            // If the first message was just metadata, we're done.
+                            // If it was mixed content (unlikely for this protocol), we'd handle it here.
+                            return;
+                        } catch (e) {
+                            // Not JSON, maybe raw data started immediately?
+                            // For this specific protocol, we expect JSON first.
+                            log('Warning: Received data before metadata or invalid JSON', 'warn');
+                        }
+                    } catch (err) {
+                        log('Error parsing metadata: ' + err.message, 'error');
+                    }
+                }
+
+                // Handle binary chunk
+                if (data instanceof ArrayBuffer) {
+                    // Check if this is actually a text JSON message (EOF marker)
+                    // that arrived as ArrayBuffer due to binaryType='arraybuffer'.
+                    if (metadata && data.byteLength < 64) {
+                        try {
+                            const text = new TextDecoder().decode(data);
+                            const msg = JSON.parse(text);
+                            if (msg.type === 'eof') {
+                                log(`EOF marker received — ${receivedBytes} / ${metadata.size} bytes`, 'success');
+                                finishDownload();
+                                return;
+                            }
+                        } catch (_) {
+                            // Not JSON — treat as file data below.
+                        }
+                    }
+                    chunks.push(data);
+                    receivedBytes += data.byteLength;
+                    if (metadata) {
+                        updateProgress(receivedBytes, metadata.size);
+                    }
+                    // Also trigger completion if all bytes received (fallback).
+                    if (metadata && receivedBytes >= metadata.size) {
+                        log('All bytes received', 'success');
+                        finishDownload();
+                    }
+                }
+            };
+
+            channel.onclose = () => {
+                log('DataChannel CLOSED', 'info');
+                finishDownload();
+            };
+
+            channel.onerror = (err) => {
+                log(`DataChannel Error: ${err.message}`, 'error');
+            };
+        }
+
+        function finishDownload() {
+            const duration = ((Date.now() - startTime) / 1000).toFixed(2);
+            log(`Transfer complete in ${duration}s`, 'success');
+            
+            if (chunks.length === 0) {
+                log('No data received', 'warn');
+                return;
+            }
+
+            const blob = new Blob(chunks, { type: 'application/octet-stream' });
+            const url = URL.createObjectURL(blob);
+            
+            downloadLink.href = url;
+            downloadLink.download = metadata ? metadata.filename : 'downloaded_file';
+            downloadLink.textContent = `Save ${metadata ? metadata.filename : 'File'} (${formatSize(receivedBytes)})`;
+            downloadLink.style.display = 'inline-block';
+            
+            // Auto-click (optional, maybe better to let user click)
+            // downloadLink.click();
+            
+            startBtn.disabled = false;
+        }
+
+        function waitForIceGathering(pc) {
+            return new Promise((resolve) => {
+                if (pc.iceGatheringState === "complete") {
+                    resolve();
+                } else {
+                    const checkState = () => {
+                        if (pc.iceGatheringState === "complete") {
+                            pc.removeEventListener("icegatheringstatechange", checkState);
+                            resolve();
+                        }
+                    };
+                    pc.addEventListener("icegatheringstatechange", checkState);
+                    // Fallback timeout in case gathering takes too long
+                    setTimeout(resolve, 2000); 
+                }
+            });
+        }
+
+        // Event Listeners
+        startBtn.addEventListener('click', startDownload);
+    </script>
+</body>
+</html>

@@ -1,7 +1,7 @@
 pub mod handler;
 pub mod session;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{SocketAddr, UdpSocket};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -21,9 +21,12 @@ use self::session::RtcSession;
 /// Command sent from the LOCK handler to the RtcManager run loop.
 pub struct CreateSessionCmd {
     pub file_path: PathBuf,
+    /// Pre-collected file size (from tokio::fs::metadata) so RtcSession
+    /// doesn't need to do blocking I/O.
+    pub file_size: u64,
     pub sdp_offer: String,
-    pub remote_candidates: Vec<String>,
-    pub reply: oneshot::Sender<Result<(u64, String), anyhow::Error>>,
+    pub remote_candidates: Vec<handler::IceCandidate>,
+    pub reply: oneshot::Sender<Result<(u64, String, Vec<handler::IceCandidate>), anyhow::Error>>,
 }
 
 /// A cloneable handle for sending session-creation commands to the RtcManager.
@@ -42,17 +45,31 @@ impl RtcHandle {
 
     /// Request the RtcManager to create a new session.
     ///
-    /// Returns `(session_id, sdp_answer_string)` on success.
+    /// Collects file metadata asynchronously before sending the command so
+    /// that no blocking I/O happens on the RtcManager task path.
+    ///
+    /// Returns `(session_id, sdp_answer_string, local_candidates)` on success.
     pub async fn create_session(
         &self,
         file_path: PathBuf,
         sdp_offer: String,
-        remote_candidates: Vec<String>,
-    ) -> Result<(u64, String), anyhow::Error> {
+        remote_candidates: Vec<handler::IceCandidate>,
+    ) -> Result<(u64, String, Vec<handler::IceCandidate>), anyhow::Error> {
+        // Collect file size asynchronously before entering the sync manager path.
+        // If this fails, bail out early rather than sending incorrect size=0.
+        let meta = tokio::fs::metadata(&file_path)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to stat file {:?}: {e}", file_path))?;
+        if !meta.is_file() {
+            return Err(anyhow::anyhow!("Not a file: {:?}", file_path));
+        }
+        let file_size = meta.len();
+
         let (reply_tx, reply_rx) = oneshot::channel();
         self.cmd_tx
             .send(CreateSessionCmd {
                 file_path,
+                file_size,
                 sdp_offer,
                 remote_candidates,
                 reply: reply_tx,
@@ -82,8 +99,8 @@ pub struct RtcManager {
     addr_map: HashMap<SocketAddr, u64>,
     /// Cloned raw UDP socket used for sending outgoing packets.
     udp_tx: Arc<UdpSocket>,
-    /// Receives the STUN-discovered public (server-reflexive) address.
-    public_addr_rx: watch::Receiver<Option<SocketAddr>>,
+    /// Receives the STUN-discovered public (server-reflexive) addresses.
+    public_addr_rx: watch::Receiver<HashSet<SocketAddr>>,
     /// Receives demuxed ICE/DTLS packets from the DemuxSocket.
     rtc_packet_rx: mpsc::Receiver<(Vec<u8>, SocketAddr)>,
     /// Receives session-creation commands from the LOCK handler.
@@ -97,12 +114,12 @@ impl RtcManager {
     ///
     /// - `udp_tx`: cloned raw UDP socket for sending.
     /// - `public_addr_rx`: watch channel carrying the STUN-discovered public
-    ///   address (may be `None` if STUN hasn't resolved yet).
+    ///   addresses (may be empty if STUN hasn't resolved yet).
     /// - `rtc_packet_rx`: channel carrying `(data, source_addr)` tuples from
     ///   the DemuxSocket for ICE STUN [0-3] and DTLS [20-63] byte ranges.
     pub fn new(
         udp_tx: Arc<UdpSocket>,
-        public_addr_rx: watch::Receiver<Option<SocketAddr>>,
+        public_addr_rx: watch::Receiver<HashSet<SocketAddr>>,
         rtc_packet_rx: mpsc::Receiver<(Vec<u8>, SocketAddr)>,
     ) -> (Self, RtcHandle) {
         let (cmd_tx, cmd_rx) = mpsc::channel(32);
@@ -125,7 +142,7 @@ impl RtcManager {
     /// the handler before the UDP socket is available from the H3 server).
     pub fn from_parts(
         udp_tx: Arc<UdpSocket>,
-        public_addr_rx: watch::Receiver<Option<SocketAddr>>,
+        public_addr_rx: watch::Receiver<HashSet<SocketAddr>>,
         rtc_packet_rx: mpsc::Receiver<(Vec<u8>, SocketAddr)>,
         cmd_rx: mpsc::Receiver<CreateSessionCmd>,
     ) -> Self {
@@ -151,30 +168,73 @@ impl RtcManager {
     fn create_session(
         &mut self,
         file_path: PathBuf,
+        file_size: u64,
         sdp_offer: &str,
-        remote_candidates: Vec<String>,
-    ) -> Result<(u64, String), anyhow::Error> {
+        remote_candidates: Vec<handler::IceCandidate>,
+    ) -> Result<(u64, String, Vec<handler::IceCandidate>), anyhow::Error> {
         let mut rtc = Rtc::new();
 
         // Determine our local bound address from the UDP socket.
         let local_addr = self.udp_tx.local_addr()?;
 
-        // Add our local host candidate.
-        let host_candidate = Candidate::host(local_addr, "udp")?;
-        rtc.add_local_candidate(host_candidate);
+        // Add host candidates.  When bound to a wildcard address (0.0.0.0
+        // or [::]), add loopback candidates so local peers can connect.
+        let mut local_candidates: Vec<handler::IceCandidate> = Vec::new();
 
-        // If we have a STUN-discovered public address, add a server-reflexive
-        // candidate so the remote peer can reach us through NAT.
-        if let Some(public_addr) = *self.public_addr_rx.borrow()
-            && public_addr != local_addr
-        {
-            match Candidate::server_reflexive(public_addr, local_addr, "udp") {
+        if local_addr.ip().is_unspecified() {
+            let port = local_addr.port();
+            // IPv6 loopback
+            match Candidate::host(SocketAddr::new(std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST), port), "udp") {
+                Ok(c) => {
+                    let sdp = c.to_sdp_string();
+                    rtc.add_local_candidate(c);
+                    local_candidates.push(handler::IceCandidate { candidate: sdp, sdp_mid: Some("0".into()), sdp_mline_index: Some(0) });
+                }
+                Err(e) => warn!("Failed to create IPv6 loopback candidate: {e}"),
+            }
+            // IPv4 loopback
+            match Candidate::host(SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), port), "udp") {
+                Ok(c) => {
+                    let sdp = c.to_sdp_string();
+                    rtc.add_local_candidate(c);
+                    local_candidates.push(handler::IceCandidate { candidate: sdp, sdp_mid: Some("0".into()), sdp_mline_index: Some(0) });
+                }
+                Err(e) => warn!("Failed to create IPv4 loopback candidate: {e}"),
+            }
+        } else {
+            let host_candidate = Candidate::host(local_addr, "udp")?;
+            let sdp = host_candidate.to_sdp_string();
+            rtc.add_local_candidate(host_candidate);
+            local_candidates.push(handler::IceCandidate { candidate: sdp, sdp_mid: Some("0".into()), sdp_mline_index: Some(0) });
+        }
+
+        // If we have STUN-discovered public addresses, add a server-reflexive
+        // candidate for each so the remote peer can reach us through NAT.
+        for public_addr in self.public_addr_rx.borrow().iter() {
+            if *public_addr == local_addr {
+                continue;
+            }
+            // str0m requires addr and base to be the same IP version.
+            // When bound to a wildcard ([::] or 0.0.0.0), pick a base
+            // address that matches public_addr's address family.
+            let base = if local_addr.ip().is_unspecified() {
+                let port = local_addr.port();
+                match public_addr {
+                    SocketAddr::V4(_) => SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), port),
+                    SocketAddr::V6(_) => SocketAddr::new(std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST), port),
+                }
+            } else {
+                local_addr
+            };
+            match Candidate::server_reflexive(*public_addr, base, "udp") {
                 Ok(srflx) => {
+                    let sdp = srflx.to_sdp_string();
                     rtc.add_local_candidate(srflx);
+                    local_candidates.push(handler::IceCandidate { candidate: sdp, sdp_mid: Some("0".into()), sdp_mline_index: Some(0) });
                     debug!("Added server-reflexive candidate: {public_addr}");
                 }
                 Err(e) => {
-                    warn!("Failed to create srflx candidate: {e}");
+                    warn!("Failed to create srflx candidate for {public_addr}: {e}");
                 }
             }
         }
@@ -191,9 +251,14 @@ impl RtcManager {
 
         let sdp_answer_string = answer.to_sdp_string();
 
-        // Add remote ICE candidates.
-        for candidate_str in &remote_candidates {
-            match Candidate::from_sdp_string(candidate_str) {
+        // Add remote ICE candidates (skip mDNS .local candidates that
+        // str0m cannot resolve).
+        for ice in &remote_candidates {
+            if ice.candidate.contains(".local") {
+                debug!("Skipping mDNS candidate: {}", ice.candidate);
+                continue;
+            }
+            match Candidate::from_sdp_string(&ice.candidate) {
                 Ok(c) => {
                     rtc.add_remote_candidate(c);
                 }
@@ -207,12 +272,24 @@ impl RtcManager {
         let session_id = self.next_session_id;
         self.next_session_id += 1;
 
-        let session = RtcSession::new(rtc, file_path, local_addr);
+        // Collect the actual candidate addresses so the session can pick
+        // the correct `Receive.destination` by address-family.
+        let candidate_addrs: Vec<SocketAddr> = local_candidates
+            .iter()
+            .filter_map(|c| {
+                // Parse the SDP candidate string to extract the address.
+                Candidate::from_sdp_string(&c.candidate)
+                    .ok()
+                    .map(|parsed| parsed.addr())
+            })
+            .collect();
+
+        let session = RtcSession::new(rtc, file_path, file_size, local_addr, candidate_addrs);
         self.sessions.insert(session_id, session);
 
         info!("Created RTC session {session_id}");
 
-        Ok((session_id, sdp_answer_string))
+        Ok((session_id, sdp_answer_string, local_candidates))
     }
 
     // ------------------------------------------------------------------
@@ -248,6 +325,7 @@ impl RtcManager {
                         Some(cmd) => {
                             let result = self.create_session(
                                 cmd.file_path,
+                                cmd.file_size,
                                 &cmd.sdp_offer,
                                 cmd.remote_candidates,
                             );
@@ -292,6 +370,10 @@ impl RtcManager {
 
     /// Route an incoming packet to the appropriate session.
     fn handle_incoming_packet(&mut self, data: &[u8], source: SocketAddr) {
+        // Normalize the source so that ::ffff:x.x.x.x matches plain IPv4
+        // entries already stored in the addr_map.
+        let source = crate::stun::normalize_addr(source);
+
         // Look up session by source address.
         let session_id = if let Some(&sid) = self.addr_map.get(&source) {
             sid
@@ -346,8 +428,12 @@ impl RtcManager {
 
         for id in &dead_ids {
             if let Some(session) = self.sessions.remove(id) {
+                let sent = session.bytes_sent();
+                let mut guard = crate::metrics::MetricsGuard::new("rtc");
+                guard.set_bytes(sent);
+                // guard Drop will record request + bytes_sent
                 info!(
-                    "Removed RTC session {id} (state={:?})",
+                    "Removed RTC session {id} (state={:?}, bytes_sent={sent})",
                     session.state()
                 );
             }

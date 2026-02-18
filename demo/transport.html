@@ -1,0 +1,226 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>WebTransport 自签名证书 Hash Demo</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; padding: 24px; }
+    .row { margin: 12px 0; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+    label { min-width: 120px; }
+    input { padding: 8px; width: min(720px, 100%); }
+    button { padding: 8px 12px; }
+    pre { background: #f6f6f6; padding: 12px; border-radius: 8px; overflow: auto; }
+    .ok { color: #0a7; }
+    .err { color: #c00; }
+    .hint { color: #555; font-size: 12px; }
+  </style>
+</head>
+<body>
+  <h1>WebTransport：接收服务端单向流文件（支持自签名证书 Hash）</h1>
+
+  <div class="row">
+    <label for="url">WebTransport URL</label>
+    <input id="url" value="https://localhost:4433/wt" />
+  </div>
+
+  <div class="row">
+    <label for="spki">SPKI SHA-256（Base64）</label>
+    <input id="spki" placeholder="可选：例如 Gi/HIwdiMcPZo2KBjnstF5kQdLI5bPrYJ8i3Vi6Ybck=" />
+  </div>
+
+  <div class="row hint">
+    说明：这里填的是“证书公钥 SPKI 的 SHA-256 指纹”（Base64），不是整张证书的 hash。
+  </div>
+
+  <div class="row">
+    <button id="btnConnect">连接并接收</button>
+    <button id="btnDownload" disabled>下载（可选）</button>
+  </div>
+
+  <div class="row">
+    <strong>状态：</strong> <span id="status">未连接</span>
+  </div>
+
+  <pre id="log"></pre>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const logEl = $("log");
+    const statusEl = $("status");
+    const btnConnect = $("btnConnect");
+    const btnDownload = $("btnDownload");
+    function hexToU8(hex) {
+    hex = hex.replace(/\s+/g, "").toLowerCase();
+    if (hex.length % 2) throw new Error("bad hex length");
+    const out = new Uint8Array(hex.length / 2);
+    for (let i = 0; i < out.length; i++) {
+        out[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+    }
+    return out;
+    }
+    function log(...args) {
+      logEl.textContent += args.map(a => (typeof a === "string" ? a : JSON.stringify(a, null, 2))).join(" ") + "\n";
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+    function setStatus(text, cls) {
+      statusEl.className = cls || "";
+      statusEl.textContent = text;
+    }
+
+    // 你要的 buffer：接收完成后变成 Uint8Array
+    let fileBuffer = null;
+    let fileBlob = null;
+
+    function decodeBase64ToUint8Array(b64) {
+      // 支持标准 base64 / urlsafe base64
+      const normalized = b64.replace(/-/g, "+").replace(/_/g, "/");
+      const bin = atob(normalized);
+      const out = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+      return out;
+    }
+
+    async function readStreamToBuffer(readableStream) {
+      const reader = readableStream.getReader();
+      const chunks = [];
+      let total = 0;
+      let fileSize = null;
+      let headerBuf = new Uint8Array(8);
+      let headerFilled = 0;
+      const startTime = performance.now();
+      let lastLogTime = startTime;
+
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+
+        let data = value;
+
+        // Parse 8-byte big-endian file size header from the beginning of the stream.
+        if (fileSize === null) {
+          const need = 8 - headerFilled;
+          const headerPart = data.subarray(0, need);
+          headerBuf.set(headerPart, headerFilled);
+          headerFilled += headerPart.byteLength;
+
+          if (headerFilled < 8) continue; // need more bytes for header
+
+          // Decode big-endian u64 (safe for files up to Number.MAX_SAFE_INTEGER ~8 PB)
+          const view = new DataView(headerBuf.buffer);
+          fileSize = Number(view.getBigUint64(0));
+          log(`文件大小: ${formatSize(fileSize)}`);
+
+          // Rest of this chunk after the header is file data.
+          data = data.subarray(need);
+          if (data.byteLength === 0) continue;
+        }
+
+        chunks.push(data);
+        total += data.byteLength;
+
+        const now = performance.now();
+        if (now - lastLogTime >= 500) {
+          const elapsedSec = (now - startTime) / 1000;
+          const avgSpeed = total / elapsedSec;
+          const pct = ((total / fileSize) * 100).toFixed(1);
+          log(`已接收: ${formatSize(total)} / ${formatSize(fileSize)} (${pct}%)，平均速度: ${formatSize(avgSpeed)}/s`);
+          lastLogTime = now;
+        }
+      }
+
+      const elapsed = (performance.now() - startTime) / 1000;
+      const avgSpeed = total / elapsed;
+      log(`传输完成: ${formatSize(total)}，耗时: ${elapsed.toFixed(2)}s，平均速度: ${formatSize(avgSpeed)}/s`);
+
+      const merged = new Uint8Array(total);
+      let offset = 0;
+      for (const c of chunks) {
+        merged.set(c, offset);
+        offset += c.byteLength;
+      }
+      return merged;
+    }
+
+    function formatSize(bytes) {
+      if (bytes >= 1024 * 1024 * 1024) return (bytes / (1024 * 1024 * 1024)).toFixed(2) + ' GB';
+      if (bytes >= 1024 * 1024) return (bytes / (1024 * 1024)).toFixed(2) + ' MB';
+      if (bytes >= 1024) return (bytes / 1024).toFixed(2) + ' KB';
+      return bytes + ' B';
+    }
+
+    async function connectAndReceiveOnce(url, spkiBase64) {
+      if (!("WebTransport" in window)) {
+        throw new Error("当前浏览器不支持 WebTransport（建议使用最新版 Chrome/Edge）。");
+      }
+
+      const options = {};
+      if (spkiBase64) {
+        options.serverCertificateHashes = [{
+          algorithm: "sha-256",
+          value: hexToU8(spkiBase64)
+        }];
+        // allowPooling 必须为 false（默认就是 false），这里显式写出来更直观
+        options.allowPooling = false;
+      }
+      console.log(options)
+
+      setStatus("连接中…");
+      log("准备连接：", url);
+      if (spkiBase64) log("启用 serverCertificateHashes：", spkiBase64);
+
+      const transport = new WebTransport(url, options);
+
+      await transport.ready;
+      setStatus("已连接，等待单向流…", "ok");
+      log("WebTransport ready ✅");
+
+      const uniReader = transport.incomingUnidirectionalStreams.getReader();
+      const { value: stream, done } = await uniReader.read();
+      if (done || !stream) {
+        throw new Error("没有收到服务端的单向流（incomingUnidirectionalStreams 已关闭或为空）。");
+      }
+
+      log("收到单向流 ✅，开始读取文件内容…");
+
+      fileBuffer = await readStreamToBuffer(stream);
+      fileBlob = new Blob([fileBuffer]);
+
+      log(`文件接收完成 ✅ 总大小: ${fileBuffer.byteLength} bytes`);
+      setStatus(`接收完成（${fileBuffer.byteLength} bytes）`, "ok");
+      btnDownload.disabled = false;
+
+      try { transport.close(); } catch {}
+      return fileBuffer;
+    }
+
+    btnConnect.addEventListener("click", async () => {
+      btnDownload.disabled = true;
+      fileBuffer = null;
+      fileBlob = null;
+      logEl.textContent = "";
+
+      const url = $("url").value.trim();
+      const spki = $("spki").value.trim();
+
+      try {
+        await connectAndReceiveOnce(url, spki);
+      } catch (err) {
+        console.error(err);
+        setStatus("出错：" + (err?.message || String(err)), "err");
+        log("❌ Error:", err?.message || String(err));
+      }
+    });
+
+    btnDownload.addEventListener("click", () => {
+      if (!fileBlob) return;
+      const a = document.createElement("a");
+      const u = URL.createObjectURL(fileBlob);
+      a.href = u;
+      a.download = "received.bin";
+      a.click();
+      URL.revokeObjectURL(u);
+    });
+  </script>
+</body>
+</html>

@@ -1,6 +1,7 @@
 mod auth;
 mod config;
 mod dav;
+mod metrics;
 mod rtc;
 mod server;
 mod stun;
@@ -15,7 +16,6 @@ use axum::middleware;
 use clap::Parser;
 use dav_server::DavHandler;
 use dav_server::localfs::LocalFs;
-use dav_server::memls::MemLs;
 use tracing::info;
 
 use crate::auth::{AuthConfig, auth_middleware, build_auth_from_args, build_auth_from_config};
@@ -33,6 +33,7 @@ fn build_router(
     prefix: &str,
     auth: AuthConfig,
     tus_manager: Option<Arc<TusUploadManager>>,
+    rtc_state: Option<rtc::handler::RtcState>,
 ) -> Router {
     let inner = LocalFs::new(root, true, false, false);
     let checksum_manager = ChecksumManager::new(vec![
@@ -43,8 +44,7 @@ fn build_router(
     let fs = ChecksumAwareFileSystem::new(inner, checksum_manager, root.to_path_buf());
 
     let mut builder = DavHandler::builder()
-        .filesystem(Box::new(fs))
-        .locksystem(MemLs::new());
+        .filesystem(Box::new(fs));
 
     if prefix != "/" {
         builder = builder.strip_prefix(prefix);
@@ -53,22 +53,154 @@ fn build_router(
     let dav = Arc::new(builder.build_handler());
 
     let mut router = Router::new()
-        .route("/-/ping", axum::routing::get(|| async { "pong" }));
+        .route("/-/ping", axum::routing::get(|| async { "pong" }))
+        .route("/-/metrics", axum::routing::get(|| async {
+            let body = metrics::gather_metrics();
+            (
+                axum::http::StatusCode::OK,
+                [(axum::http::header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+                body,
+            )
+        }))
+        .route("/minio/metrics/v3/bucket/api/dfs", {
+            let credentials: Option<(String, String)> = auth.basic_username()
+                .zip(auth.basic_password())
+                .map(|(u, p)| (u.to_string(), p.to_string()));
+            axum::routing::get(move |headers: axum::http::HeaderMap| {
+                let credentials = credentials.clone();
+                async move {
+                    // If basic auth is configured, require either a valid MinIO JWT or Basic Auth
+                    if let Some((ref username, ref password)) = credentials {
+                        let auth_header = headers
+                            .get(axum::http::header::AUTHORIZATION)
+                            .and_then(|v| v.to_str().ok());
+
+                        let authorized = match auth_header {
+                            // MinIO-compatible JWT: Bearer <token>
+                            Some(h) if h.starts_with("Bearer ") => {
+                                metrics::validate_minio_jwt(&h[7..], password)
+                            }
+                            // WebDAV Basic Auth: Basic <base64>
+                            Some(h) if h.starts_with("Basic ") => {
+                                use base64::Engine;
+                                base64::engine::general_purpose::STANDARD
+                                    .decode(&h[6..])
+                                    .ok()
+                                    .and_then(|bytes| String::from_utf8(bytes).ok())
+                                    .map(|decoded| {
+                                        decoded.split_once(':')
+                                            .map(|(u, p)| u == username && p == password)
+                                            .unwrap_or(false)
+                                    })
+                                    .unwrap_or(false)
+                            }
+                            _ => false,
+                        };
+
+                        if !authorized {
+                            return (
+                                axum::http::StatusCode::UNAUTHORIZED,
+                                [(axum::http::header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+                                String::from("Unauthorized"),
+                            );
+                        }
+                    }
+                    let body = metrics::gather_minio_compat_metrics();
+                    (
+                        axum::http::StatusCode::OK,
+                        [(axum::http::header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+                        body,
+                    )
+                }
+            })
+        });
 
     // If TUS is enabled, merge TUS routes BEFORE the DavHandler fallback
     if let Some(mgr) = tus_manager {
         router = router.merge(tus_routes(prefix, mgr, root.to_path_buf()));
     }
 
+    // Build the fallback that handles both LOCK (WebRTC signaling) and
+    // regular WebDAV methods.  LOCK is checked first; everything else
+    // falls through to the DavHandler.
+    let lock_prefix = prefix.to_string();
     router
         .fallback(move |req: axum::extract::Request| {
             let dav = dav.clone();
-            async move { dav.handle(req).await }
+            let rtc_state = rtc_state.clone();
+            let prefix = lock_prefix.clone();
+            async move {
+                use axum::response::IntoResponse;
+
+                // Check for LOCK method — dispatch to WebRTC handler
+                if req.method().as_str() == "LOCK" {
+                    if let Some(state) = rtc_state {
+                        return handle_lock(state, &prefix, req).await;
+                    }
+                    // RTC not enabled — LOCK is not supported
+                    return axum::http::StatusCode::NOT_IMPLEMENTED.into_response();
+                }
+
+                // All other methods → DavHandler
+                dav.handle(req).await.into_response()
+            }
         })
         .layer(middleware::from_fn(move |req, next| {
             let auth = auth.clone();
             auth_middleware(auth, req, next)
         }))
+}
+
+/// Extract the file-relative path from the request URI, strip the DAV prefix,
+/// parse the JSON body, and forward to [`rtc::handler::lock_handler`].
+async fn handle_lock(
+    rtc_state: rtc::handler::RtcState,
+    prefix: &str,
+    req: axum::extract::Request,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+
+    // Strip prefix from URI path to get the file-relative path.
+    let uri_path = req.uri().path().to_string();
+    let rel_path = if prefix != "/" && !prefix.is_empty() {
+        uri_path
+            .strip_prefix(prefix.trim_end_matches('/'))
+            .unwrap_or(&uri_path)
+            .to_string()
+    } else {
+        uri_path
+    };
+
+    // Parse JSON body
+    let body_bytes = match axum::body::to_bytes(req.into_body(), 64 * 1024).await {
+        Ok(b) => b,
+        Err(e) => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                axum::Json(serde_json::json!({ "error": format!("Failed to read body: {e}") })),
+            )
+                .into_response();
+        }
+    };
+
+    let lock_req: rtc::handler::LockRequest = match serde_json::from_slice(&body_bytes) {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                axum::Json(serde_json::json!({ "error": format!("Invalid JSON: {e}") })),
+            )
+                .into_response();
+        }
+    };
+
+    // Call the actual lock handler (passing state, path, parsed body directly).
+    rtc::handler::lock_handler(
+        axum::extract::State(rtc_state),
+        rel_path,
+        axum::Json(lock_req),
+    )
+    .await
 }
 
 /// Build TusConfig + temp_dir from a parsed config file's TUS section.
@@ -165,7 +297,38 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    let app = build_router(&root, &args.prefix, auth.clone(), tus_manager);
+    // -------------------------------------------------------------------
+    // WebRTC DataChannel setup — create channels + handle BEFORE
+    // build_router so the LOCK route is wired into the fallback.
+    // The actual RtcManager is spawned later once we have the UDP socket.
+    // -------------------------------------------------------------------
+    let rtc_packet_tx = if args.enable_rtc {
+        Some(tokio::sync::mpsc::channel::<(Vec<u8>, std::net::SocketAddr)>(1024))
+    } else {
+        None
+    };
+    let (rtc_tx_for_h3, rtc_rx_for_manager) = match rtc_packet_tx {
+        Some((tx, rx)) => (Some(tx), Some(rx)),
+        None => (None, None),
+    };
+
+    let (rtc_handle_holder, rtc_rx_holder) = if let Some(rtc_rx) = rtc_rx_for_manager {
+        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel::<rtc::CreateSessionCmd>(32);
+        let handle = rtc::RtcHandle::new(cmd_tx);
+        (Some(handle), Some((cmd_rx, rtc_rx)))
+    } else {
+        (None, None)
+    };
+
+    let rtc_state_for_router = rtc_handle_holder.as_ref().map(|handle| {
+        rtc::handler::RtcState {
+            rtc_handle: handle.clone(),
+            root: root.clone(),
+            prefix: args.prefix.clone(),
+        }
+    });
+
+    let app = build_router(&root, &args.prefix, auth.clone(), tus_manager, rtc_state_for_router);
 
     // Determine TLS source: file-based or self-signed
     let needs_tls = args.https_port.is_some() || args.http3_port.is_some();
@@ -186,12 +349,15 @@ async fn main() -> anyhow::Result<()> {
 
     // Resolve STUN config (CLI > config file > none)
     let stun_config: Option<StunConfig> = {
-        let stun_server_str = args.stun_server.as_deref().or_else(|| {
-            file_config
-                .as_ref()
-                .and_then(|fc| fc.stun.as_ref())
-                .and_then(|s| s.server.as_deref())
-        });
+        // Collect server strings: CLI args take priority, fallback to config file
+        let server_strs: Vec<String> = if !args.stun_server.is_empty() {
+            args.stun_server.clone()
+        } else if let Some(ref fc) = file_config {
+            fc.stun.as_ref().map(|s| s.all_servers()).unwrap_or_default()
+        } else {
+            vec![]
+        };
+
         let stun_interval_secs = args.stun_interval_secs.or_else(|| {
             file_config
                 .as_ref()
@@ -199,16 +365,39 @@ async fn main() -> anyhow::Result<()> {
                 .and_then(|s| s.interval_secs)
         });
 
-        if let Some(server_str) = stun_server_str {
+        if !server_strs.is_empty() {
             use std::net::ToSocketAddrs;
-            let server = server_str
-                .to_socket_addrs()?
-                .find(|a| a.is_ipv4())
-                .or_else(|| server_str.to_socket_addrs().ok()?.next())
-                .ok_or_else(|| anyhow::anyhow!("Failed to resolve STUN server: {server_str}"))?;
+            let mut all_addrs = Vec::new();
+            for server_str in &server_strs {
+                match server_str.to_socket_addrs() {
+                    Ok(addrs) => {
+                        let resolved: Vec<_> = addrs.map(stun::normalize_addr).collect();
+                        if resolved.is_empty() {
+                            tracing::warn!("STUN server '{server_str}' resolved to no addresses");
+                        } else {
+                            for addr in &resolved {
+                                info!("STUN server '{server_str}' resolved to {addr}");
+                            }
+                            all_addrs.extend(resolved);
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to resolve STUN server '{server_str}': {e}");
+                    }
+                }
+            }
+            if all_addrs.is_empty() {
+                anyhow::bail!("No STUN server addresses could be resolved");
+            }
+            // Deduplicate
+            all_addrs.sort();
+            all_addrs.dedup();
             let interval = Duration::from_secs(stun_interval_secs.unwrap_or(20));
-            info!("STUN NAT traversal configured: {server} (interval: {interval:?})");
-            Some(StunConfig { server, interval })
+            info!(
+                "STUN NAT traversal configured: {} address(es) (interval: {interval:?})",
+                all_addrs.len()
+            );
+            Some(StunConfig { servers: all_addrs, interval })
         } else {
             None
         }
@@ -217,53 +406,11 @@ async fn main() -> anyhow::Result<()> {
     let mut handles = Vec::new();
     let mut h3_endpoint: Option<quinn::Endpoint> = None;
 
-    // -------------------------------------------------------------------
-    // WebRTC DataChannel setup (before server spawning so all servers
-    // get the LOCK routes).
-    // -------------------------------------------------------------------
-    let rtc_packet_tx = if args.enable_rtc {
-        Some(tokio::sync::mpsc::channel::<(Vec<u8>, std::net::SocketAddr)>(1024))
-    } else {
-        None
-    };
-    let (rtc_tx_for_h3, rtc_rx_for_manager) = match rtc_packet_tx {
-        Some((tx, rx)) => (Some(tx), Some(rx)),
-        None => (None, None),
-    };
-
-    // If RTC is enabled, we'll create the RtcHandle now (via a oneshot pattern)
-    // and merge LOCK routes into the app.  The RtcManager itself is spawned
-    // later once we have the UDP socket + public_addr_rx from the H3 server.
-    let (rtc_handle_holder, rtc_rx_holder) = if let Some(rtc_rx) = rtc_rx_for_manager {
-        // Create a placeholder RtcManager with a dummy socket — we'll replace
-        // the actual manager in the spawn block once we have the real socket.
-        // Instead, use a deferred pattern: create command channels now, wire
-        // the RtcManager later.
-        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel::<rtc::CreateSessionCmd>(32);
-        let handle = rtc::RtcHandle::new(cmd_tx);
-        (Some(handle), Some((cmd_rx, rtc_rx)))
-    } else {
-        (None, None)
-    };
-
-    // Merge LOCK routes into app if RTC is enabled.
-    let app = if let Some(ref rtc_handle) = rtc_handle_holder {
-        let rtc_state = rtc::handler::RtcState {
-            rtc_handle: rtc_handle.clone(),
-            root: root.clone(),
-            prefix: args.prefix.clone(),
-        };
-        let lock_router = rtc::handler::lock_routes(&args.prefix, rtc_state);
-        app.merge(lock_router)
-    } else {
-        app
-    };
-
     // HTTP server
     if let Some(port) = args.http_port {
-        let app = app.clone();
+        let http_app = app.clone().layer(server::metrics_layer::MetricsLayer::new("http"));
         handles.push(tokio::spawn(async move {
-            if let Err(e) = server::http::serve(port, app).await {
+            if let Err(e) = server::http::serve(port, http_app).await {
                 tracing::error!("HTTP server error: {e}");
             }
         }));
@@ -271,7 +418,7 @@ async fn main() -> anyhow::Result<()> {
 
     // HTTPS server
     if let Some(port) = args.https_port {
-        let app = app.clone();
+        let https_app = app.clone().layer(server::metrics_layer::MetricsLayer::new("http"));
         let https_config = match tls_source.as_ref().unwrap() {
             TlsSource::File { cert, key } => server::tls::build_https_config(cert, key)?,
             TlsSource::SelfSigned(resolver) => {
@@ -279,7 +426,7 @@ async fn main() -> anyhow::Result<()> {
             }
         };
         handles.push(tokio::spawn(async move {
-            if let Err(e) = server::https::serve(port, https_config, app).await {
+            if let Err(e) = server::https::serve(port, https_config, https_app).await {
                 tracing::error!("HTTPS server error: {e}");
             }
         }));
@@ -287,7 +434,7 @@ async fn main() -> anyhow::Result<()> {
 
     // HTTP/3 server (with optional STUN NAT traversal + WebTransport)
     if let Some(port) = args.http3_port {
-        let app = app.clone();
+        let h3_app = app.clone().layer(server::metrics_layer::MetricsLayer::new("h3"));
         let quic_config = match tls_source.as_ref().unwrap() {
             TlsSource::File { cert, key } => server::tls::build_quic_config(cert, key)?,
             TlsSource::SelfSigned(resolver) => {
@@ -299,7 +446,7 @@ async fn main() -> anyhow::Result<()> {
             root: root.clone(),
             prefix: args.prefix.clone(),
         };
-        let h3_handle = server::http3::spawn(port, quic_config, app, stun_config, wt_config, rtc_tx_for_h3)?;
+        let h3_handle = server::http3::spawn(port, quic_config, h3_app, stun_config, wt_config, rtc_tx_for_h3)?;
 
         // Log public address discovery in background (if STUN enabled)
         // and optionally notify via webhook.
@@ -317,23 +464,24 @@ async fn main() -> anyhow::Result<()> {
             });
 
             while public_addr_rx.changed().await.is_ok() {
-                let addr = match *public_addr_rx.borrow_and_update() {
-                    Some(a) => a,
-                    None => continue,
-                };
-                // borrow dropped here — safe to .await below
-                info!("Public UDP endpoint available at: {addr}");
+                let addrs: std::collections::HashSet<std::net::SocketAddr> = public_addr_rx.borrow_and_update().clone();
+                if addrs.is_empty() {
+                    continue;
+                }
+                // borrow dropped here (cloned) — safe to .await below
+                let addrs_str: Vec<String> = addrs.iter().map(|a| a.to_string()).collect();
+                let body = addrs_str.join(",");
+                info!("Public UDP endpoint(s) available: {body}");
 
                 // Fire webhook if configured
                 if let Some(Ok((client, url, auth))) = &webhook_client {
-                    let body = addr.to_string();
-                    let mut req = client.post(url.clone()).body(body);
+                    let mut req = client.post(url.clone()).body(body.clone());
                     if let Some((user, pass)) = auth {
                         req = req.basic_auth(user, Some(pass));
                     }
                     match req.send().await {
                         Ok(resp) => {
-                            info!("Webhook notified: {addr} → {} {}", url, resp.status());
+                            info!("Webhook notified: {body} → {} {}", url, resp.status());
                         }
                         Err(e) => {
                             tracing::warn!("Webhook failed: {e}");

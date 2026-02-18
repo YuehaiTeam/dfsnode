@@ -7,6 +7,9 @@ use tower::Service;
 use tracing::info;
 
 /// Start an HTTPS server with a pre-built rustls ServerConfig.
+///
+/// The `app` Router should already have a `MetricsLayer` applied so that
+/// response bodies are automatically tracked.
 pub async fn serve(
     port: u16,
     rustls_config: Arc<rustls::ServerConfig>,
@@ -36,7 +39,8 @@ pub async fn serve(
             let service = hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
                 let mut app = app.clone();
                 async move {
-                    Ok::<_, std::convert::Infallible>(app.call(req).await.into_response())
+                    let resp = app.call(req).await.unwrap_or_else(|err| match err {});
+                    Ok::<_, std::convert::Infallible>(resp)
                 }
             });
 
@@ -49,21 +53,5 @@ pub async fn serve(
                 tracing::debug!("HTTPS connection error from {peer_addr}: {e}");
             }
         });
-    }
-}
-
-trait IntoAxumResponse {
-    fn into_response(self) -> axum::response::Response;
-}
-
-impl<T> IntoAxumResponse for Result<axum::response::Response, T> {
-    fn into_response(self) -> axum::response::Response {
-        match self {
-            Ok(resp) => resp,
-            Err(_) => axum::response::Response::builder()
-                .status(500)
-                .body(axum::body::Body::empty())
-                .unwrap(),
-        }
     }
 }

@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -14,7 +15,7 @@ use crate::stun::{self, StunConfig};
 /// Handle returned by [`spawn()`] for the HTTP/3 server.
 pub struct Http3Handle {
     pub task: tokio::task::JoinHandle<anyhow::Result<()>>,
-    pub public_addr: watch::Receiver<Option<SocketAddr>>,
+    pub public_addr: watch::Receiver<HashSet<SocketAddr>>,
     pub endpoint: quinn::Endpoint,
     /// Cloned raw UDP socket for RtcManager to send packets.
     /// Only available when STUN is enabled.
@@ -37,14 +38,24 @@ pub fn spawn(
     let mut transport = quinn::TransportConfig::default();
     // Allow unidirectional streams for WebTransport server→client file push
     transport.max_concurrent_uni_streams(16_u16.into());
+    transport.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
     server_config.transport_config(Arc::new(transport));
 
     let addr: SocketAddr = format!("[::]:{port}").parse()?;
 
     // Build endpoint with or without STUN
     let (endpoint, public_addr_rx, udp_socket_for_rtc) = if let Some(stun_cfg) = stun_config {
-        let raw_socket = std::net::UdpSocket::bind(addr)?;
-        raw_socket.set_nonblocking(true)?;
+        // Create a dual-stack UDP socket so we can send/receive both
+        // IPv4 and IPv6.  Windows defaults IPV6_V6ONLY=true, so we
+        // must use socket2 to explicitly disable it.
+        let raw_socket = {
+            use socket2::{Domain, Protocol, Socket, Type};
+            let sock = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
+            sock.set_only_v6(false)?;
+            sock.set_nonblocking(true)?;
+            sock.bind(&addr.into())?;
+            std::net::UdpSocket::from(sock)
+        };
 
         // Clone for RtcManager sending (before moving into stun setup)
         let rtc_udp_socket = Arc::new(raw_socket.try_clone()?);
@@ -65,7 +76,7 @@ pub fn spawn(
         (endpoint, stun_setup.public_addr_rx, Some(rtc_udp_socket))
     } else {
         let endpoint = quinn::Endpoint::server(server_config, addr)?;
-        let (_, rx) = watch::channel(None);
+        let (_, rx) = watch::channel(HashSet::new());
         info!("HTTP/3 server listening on https://{addr} (QUIC/UDP)");
         (endpoint, rx, None)
     };
@@ -140,6 +151,11 @@ async fn handle_connection(
 }
 
 /// Bridge a single h3 request into the axum Router.
+///
+/// The `app` Router has a `MetricsLayer("h3")` applied, so the response body is
+/// a `MetricsBody<_>`.  We stream frames from it one by one, sending each data
+/// chunk over the QUIC stream.  MetricsBody counts bytes as they are polled and
+/// records both request count and bytes_sent in its Drop — even on early `?` exit.
 async fn handle_request(
     req: http::Request<()>,
     mut stream: h3::server::RequestStream<h3_quinn::BidiStream<bytes::Bytes>, bytes::Bytes>,
@@ -156,7 +172,7 @@ async fn handle_request(
     let body = axum::body::Body::from(bytes::Bytes::from(body_data));
     let request = http::Request::from_parts(parts, body);
 
-    // Dispatch through the axum Router
+    // Dispatch through the axum Router (response body is MetricsBody from Layer)
     let response = app.call(request).await.unwrap_or_else(|err| match err {});
 
     let (resp_parts, resp_body) = response.into_parts();
@@ -165,16 +181,22 @@ async fn handle_request(
     let resp_head = http::Response::from_parts(resp_parts, ());
     stream.send_response(resp_head).await?;
 
-    // Stream response body back over QUIC
-    let collected = resp_body
-        .collect()
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to collect response body: {e}"))?;
-    let body_bytes = collected.to_bytes();
-    if !body_bytes.is_empty() {
-        stream.send_data(body_bytes).await?;
+    // Stream response body back over QUIC — frame by frame (no full buffering).
+    // MetricsBody tracks bytes as each frame is polled via poll_frame().
+    let mut body = resp_body;
+    while let Some(frame_result) = body.frame().await {
+        let frame = frame_result
+            .map_err(|e| anyhow::anyhow!("body frame error: {e}"))?;
+
+        if let Ok(data) = frame.into_data() {
+            if !data.is_empty() {
+                stream.send_data(data).await?;
+            }
+        }
+        // Trailers and other frame types are silently ignored for H3.
     }
 
     stream.finish().await?;
+
     Ok(())
 }

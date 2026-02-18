@@ -165,6 +165,7 @@ pub fn spawn_refresh_task(
                                             quinn::TransportConfig::default();
                                         transport
                                             .max_concurrent_uni_streams(16u32.into());
+                                        transport.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
                                         let mut server_config =
                                             quinn::ServerConfig::with_crypto(Arc::new(
                                                 quic_crypto,
