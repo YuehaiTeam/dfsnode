@@ -185,7 +185,7 @@ impl RtcManager {
         sdp_offer: &str,
         remote_candidates: Vec<handler::IceCandidate>,
     ) -> Result<(u64, String, Vec<handler::IceCandidate>), anyhow::Error> {
-        let mut rtc = Rtc::new();
+        let mut rtc = Rtc::new(Instant::now());
 
         // Determine our local bound address from the UDP socket.
         let local_addr = self.udp_tx.local_addr()?;

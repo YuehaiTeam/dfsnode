@@ -227,7 +227,7 @@ fn build_tus_from_config(
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Install the ring crypto provider before any rustls usage (quinn, tokio-rustls, etc.)
-    rustls::crypto::ring::default_provider()
+    rustls::crypto::aws_lc_rs::default_provider()
         .install_default()
         .expect("Failed to install rustls crypto provider");
 

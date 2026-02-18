@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
-use rcgen::{CertificateParams, DnType, KeyPair, SanType, PKCS_ECDSA_P256_SHA256};
+use rcgen::{CertificateParams, DnType, KeyPair, PublicKeyData, SanType, PKCS_ECDSA_P256_SHA256};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
@@ -82,7 +82,8 @@ pub fn generate_self_signed()
 
     let cert = params.self_signed(&key_pair)?;
     let cert_der_bytes = cert.der().to_vec();
-    let spki_der_bytes = key_pair.public_key_der().to_vec();
+    // SPKI (SubjectPublicKeyInfo) in DER format, used for pinning.
+    let spki_der_bytes = key_pair.subject_public_key_info();
 
     // Print certificate fingerprints for pinning / debugging
     let cert_hash = Sha256::digest(&cert_der_bytes);
@@ -103,7 +104,7 @@ pub fn generate_self_signed()
 /// Generate a [`CertifiedKey`] for use with rustls `ResolvesServerCert`.
 fn generate_certified_key() -> anyhow::Result<CertifiedKey> {
     let (certs, key_der) = generate_self_signed()?;
-    let signing_key = rustls::crypto::ring::sign::any_supported_type(&key_der)?;
+    let signing_key = rustls::crypto::aws_lc_rs::sign::any_supported_type(&key_der)?;
     Ok(CertifiedKey::new(certs, signing_key))
 }
 

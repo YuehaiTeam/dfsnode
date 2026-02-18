@@ -14,7 +14,12 @@ futures-util = "0.3"
 # HTTP server
 axum = "0.8"
 hyper = { version = "1", features = ["http1", "http2", "server"] }
-hyper-util = { version = "0.1", features = ["tokio", "http1", "http2", "server-auto"] }
+hyper-util = { version = "0.1", features = [
+    "tokio",
+    "http1",
+    "http2",
+    "server-auto",
+] }
 http = "1"
 http-body = "1"
 http-body-util = "0.1"
@@ -23,13 +28,21 @@ bytes = "1"
 
 # TLS / HTTPS
 tokio-rustls = "0.26"
-rustls = { version = "0.23", features = ["ring"] }
+rustls = { version = "0.23", features = ["aws-lc-rs"] }
 rustls-pemfile = "2"
 
 # HTTP/3 (QUIC) + WebTransport
-quinn = "0.11"
+quinn = { version = "0.11", default-features = false, features = [
+    "bloom",
+    "log",
+    "platform-verifier",
+    "runtime-tokio",
+    "rustls-aws-lc-rs",
+] }
 h3 = { git = "https://github.com/hyperium/h3", branch = "master" }
-h3-quinn = { git = "https://github.com/hyperium/h3", branch = "master", features = ["datagram"] }
+h3-quinn = { git = "https://github.com/hyperium/h3", branch = "master", features = [
+    "datagram",
+] }
 h3-webtransport = { git = "https://github.com/hyperium/h3", branch = "master" }
 h3-datagram = { git = "https://github.com/hyperium/h3", branch = "master" }
 
@@ -42,7 +55,7 @@ time = "0.3"
 
 # Checksums
 sha1 = "0.10"
-md5 = "0.7"
+md5 = "0.8"
 
 # Extended attributes (checksum cache)
 fsquirrel = "0.1"
@@ -62,7 +75,7 @@ hex = "0.4"
 
 # Auth
 base64 = "0.22"
-jsonwebtoken = "9"
+jsonwebtoken = "10"
 
 # Config file
 serde_yaml = "0.9"
@@ -71,24 +84,28 @@ serde_yaml = "0.9"
 uuid = { version = "1", features = ["v4"] }
 
 # HTTP client (webhook)
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+reqwest = { version = "0.13.2" }
 url = "2"
 
 # Self-signed certificate generation
-rcgen = { version = "0.13", features = ["ring"] }
+rcgen = { version = "0.14", features = [
+    "crypto",
+    "pem",
+    "aws_lc_rs",
+], default-features = false }
 arc-swap = "1"
 
 # WebRTC DataChannel (Sans-I/O)
-str0m = { version = "0.15", default-features = true }
+str0m = { version = "0.16.2", default-features = true }
 
 # Dual-stack socket creation
-socket2 = "0.5"
+socket2 = "0.6"
 
 # Error handling
 anyhow = "1"
 
 # Prometheus metrics
-prometheus = { version = "0.13", features = ["process"] }
+prometheus = { version = "0.14", features = ["process"] }
 lazy_static = "1.5"
 
 [profile.dev]
@@ -97,3 +114,6 @@ debug = "line-tables-only"
 [patch.crates-io]
 # Use local fork of sctp-proto with increased buffer size for high-bandwidth WAN links
 sctp-proto = { path = ".cache/sctp-proto" }
+
+# Patch str0m to raise SCTP buffered cap for DataChannel throughput.
+str0m = { path = ".cache/str0m-0.16.2" }

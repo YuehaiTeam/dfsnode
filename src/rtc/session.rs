@@ -16,6 +16,20 @@ use tracing::{debug, info, warn};
 /// Chunk size for file reads (64 KB).
 const CHUNK_SIZE: usize = 64 * 1024;
 
+/// Limit how many bytes we enqueue into the DataChannel per `poll_outputs` call.
+///
+/// `str0m` can recurse internally while turning queued SCTP data into outputs;
+/// enqueueing too much at once (especially after loss/retransmits) can trigger
+/// a stack overflow in the tokio worker thread.
+const MAX_WRITE_PER_CYCLE: usize = 512 * 1024;
+
+/// Limit how many `Rtc::poll_output()` results we process per drain.
+///
+/// On `str0m` v0.15, `poll_output()` can recurse internally when SCTP has a
+/// large amount of work to flush (e.g. after retransmits). Draining unboundedly
+/// increases the risk of stack overflow.
+const MAX_POLL_OUTPUTS_PER_DRAIN: usize = 2048;
+
 /// High watermark: stop injecting when `buffered_amount()` >= this value.
 const HIGH_WATERMARK: usize = 4 * 1024 * 1024;
 
@@ -339,10 +353,23 @@ impl RtcSession {
     /// Drain `rtc.poll_output()` until we get a `Timeout`, sending any
     /// `Transmit` packets and processing events.
     fn drain_poll_output(&mut self, udp_tx: &UdpSocket) {
+        let mut n: usize = 0;
         loop {
+            if n >= MAX_POLL_OUTPUTS_PER_DRAIN {
+                // We didn't reach a Timeout yet, but we must bound work per call.
+                // Schedule an immediate wake so we continue draining soon.
+                self.cached_timeout = Some(Instant::now());
+                warn!(
+                    session_id = self.session_id,
+                    max_outputs = MAX_POLL_OUTPUTS_PER_DRAIN,
+                    "Reached poll_output drain cap; yielding to avoid stack overflow"
+                );
+                break;
+            }
             match self.rtc.poll_output() {
                 Ok(output) => match output {
                     Output::Transmit(t) => {
+                        n = n.saturating_add(1);
                         let dest = to_v6_mapped(t.destination);
                         if let Err(e) = udp_tx.send_to(&t.contents, dest) {
                             warn!("UDP send error to {}: {e}", t.destination);
@@ -353,6 +380,7 @@ impl RtcSession {
                         break;
                     }
                     Output::Event(event) => {
+                        n = n.saturating_add(1);
                         self.handle_event(event);
                     }
                 },
@@ -481,8 +509,13 @@ impl RtcSession {
         let Some(cid) = self.channel_id else { return };
 
         let mut did_write = false;
+        let mut wrote_this_cycle: usize = 0;
 
         loop {
+            if wrote_this_cycle >= MAX_WRITE_PER_CYCLE {
+                break;
+            }
+
             // Check backpressure: if buffered_amount >= HIGH_WATERMARK, stop.
             {
                 let Some(mut ch) = self.rtc.channel(cid) else {
@@ -491,11 +524,6 @@ impl RtcSession {
                     return;
                 };
                 if ch.buffered_amount() >= HIGH_WATERMARK {
-                    debug!(
-                        "Buffered amount {} >= high watermark {} — pausing injection",
-                        ch.buffered_amount(),
-                        HIGH_WATERMARK
-                    );
                     break;
                 }
             }
@@ -545,22 +573,20 @@ impl RtcSession {
 
             match self.rtc.channel(cid) {
                 Some(mut ch) => match ch.write(true, remaining) {
-                    Ok(0) => {
+                    Ok(false) => {
                         // Buffer full — leave current_chunk as-is, retry later.
-                        debug!("DataChannel buffer full — pausing send");
                         break;
                     }
-                    Ok(written) => {
-                        self.bytes_sent += written as u64;
+                    Ok(true) => {
+                        // str0m v0.16 write is all-or-nothing.
+                        self.bytes_sent += remaining.len() as u64;
                         self.last_activity = Instant::now();
-                        self.current_off += written;
                         did_write = true;
+                        wrote_this_cycle = wrote_this_cycle.saturating_add(remaining.len());
 
-                        if self.current_off >= chunk.len() {
-                            // Chunk fully written — drop it (no clone needed).
-                            self.current_chunk = None;
-                            self.current_off = 0;
-                        }
+                        // Whole remaining slice accepted.
+                        self.current_chunk = None;
+                        self.current_off = 0;
                         // Continue the loop to try writing more.
                     }
                     Err(e) => {
