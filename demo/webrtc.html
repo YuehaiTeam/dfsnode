@@ -251,14 +251,15 @@
         // State
         let pc = null;
         let dc = null;
-        let chunks = [];
-        let metadata = null;
+        /** @type {Map<number, Uint8Array>} offset -> payload */
+        let chunkMap = new Map();
+        let fileTotal = 0;       // total file size from headers
+        let receivedBytes = 0;   // unique payload bytes received so far
+        let eofReceived = false;
+        let finished = false;
         let startTime = 0;
-        let receivedBytes = 0;
         let lastUpdate = 0;
-
-        // Configuration
-        const CHUNK_SIZE = 16384; // 16KB standard chunk size
+        let fileName = '';       // derived from URL path
 
         function log(msg, type = 'info') {
             const div = document.createElement('div');
@@ -303,10 +304,13 @@
                 dc.close();
                 dc = null;
             }
-            chunks = [];
-            metadata = null;
+            chunkMap = new Map();
+            fileTotal = 0;
             receivedBytes = 0;
+            eofReceived = false;
+            finished = false;
             startTime = 0;
+            fileName = '';
             
             progressSection.style.display = 'none';
             downloadLink.style.display = 'none';
@@ -344,7 +348,7 @@
 
                 // Step 2: Create DataChannel
                 dc = pc.createDataChannel("file-transfer", {
-                    ordered: true
+                    ordered: false
                 });
                 
                 setupDataChannel(dc);
@@ -427,109 +431,133 @@
             channel.binaryType = "arraybuffer";
 
             channel.onopen = () => {
-                log('DataChannel OPEN', 'success');
+                log('DataChannel OPEN (unordered)', 'success');
                 startTime = Date.now();
                 lastUpdate = startTime;
+
+                // Derive filename from URL path for display.
+                const filePath = document.getElementById('file-path').value;
+                fileName = filePath.split('/').pop() || 'downloaded_file';
+                fileNameEl.textContent = fileName;
             };
 
             channel.onmessage = (e) => {
                 const data = e.data;
-
-                // First message is metadata (JSON string)
-                if (!metadata) {
-                    try {
-                        // Even if binaryType is arraybuffer, strings sent via send() arrive as strings
-                        // But if server sends bytes that happen to be JSON, we might need to decode
-                        let jsonStr;
-                        if (typeof data === 'string') {
-                            jsonStr = data;
-                        } else {
-                            jsonStr = new TextDecoder().decode(data);
-                        }
-                        
-                        // Try to parse as JSON
-                        try {
-                            metadata = JSON.parse(jsonStr);
-                            log(`Receiving file: ${metadata.filename} (${formatSize(metadata.size)})`, 'data');
-                            
-                            // Initialize UI
-                            fileNameEl.textContent = metadata.filename;
-                            fileSizeEl.textContent = formatSize(metadata.size);
-                            progressSection.style.display = 'block';
-                            
-                            // If the first message was just metadata, we're done.
-                            // If it was mixed content (unlikely for this protocol), we'd handle it here.
-                            return;
-                        } catch (e) {
-                            // Not JSON, maybe raw data started immediately?
-                            // For this specific protocol, we expect JSON first.
-                            log('Warning: Received data before metadata or invalid JSON', 'warn');
-                        }
-                    } catch (err) {
-                        log('Error parsing metadata: ' + err.message, 'error');
-                    }
+                if (!(data instanceof ArrayBuffer) || data.byteLength < 8) {
+                    // Unexpected message; ignore.
+                    return;
                 }
 
-                // Handle binary chunk
-                if (data instanceof ArrayBuffer) {
-                    // Check if this is actually a text JSON message (EOF marker)
-                    // that arrived as ArrayBuffer due to binaryType='arraybuffer'.
-                    if (metadata && data.byteLength < 64) {
-                        try {
-                            const text = new TextDecoder().decode(data);
-                            const msg = JSON.parse(text);
-                            if (msg.type === 'eof') {
-                                log(`EOF marker received — ${receivedBytes} / ${metadata.size} bytes`, 'success');
-                                finishDownload();
-                                return;
-                            }
-                        } catch (_) {
-                            // Not JSON — treat as file data below.
-                        }
-                    }
-                    chunks.push(data);
-                    receivedBytes += data.byteLength;
-                    if (metadata) {
-                        updateProgress(receivedBytes, metadata.size);
-                    }
-                    // Also trigger completion if all bytes received (fallback).
-                    if (metadata && receivedBytes >= metadata.size) {
-                        log('All bytes received', 'success');
-                        finishDownload();
-                    }
+                const header = new DataView(data, 0, 8);
+
+                // Check for EOF marker: 8 bytes all 0xFF.
+                if (header.getUint32(0) === 0xFFFFFFFF && header.getUint32(4) === 0xFFFFFFFF) {
+                    log(`EOF marker received — ${receivedBytes} bytes received`, 'success');
+                    eofReceived = true;
+                    tryFinish();
+                    return;
+                }
+
+                // Parse header: offset (u32 BE) + total (u32 BE).
+                const offset = header.getUint32(0, false); // big-endian
+                const total  = header.getUint32(4, false);
+                const payload = new Uint8Array(data, 8);   // rest is file data
+
+                // Initialize UI on first data chunk.
+                if (fileTotal === 0 && total > 0) {
+                    fileTotal = total;
+                    fileSizeEl.textContent = formatSize(total);
+                    progressSection.style.display = 'block';
+                    log(`Receiving file: ${fileName} (${formatSize(total)})`, 'data');
+                }
+
+                // Store chunk by offset (idempotent — duplicate offsets overwrite).
+                if (!chunkMap.has(offset)) {
+                    chunkMap.set(offset, payload);
+                    receivedBytes += payload.byteLength;
+                }
+
+                if (fileTotal > 0) {
+                    updateProgress(receivedBytes, fileTotal);
+                }
+
+                // Completion fallback: if all unique bytes received.
+                if (fileTotal > 0 && receivedBytes >= fileTotal) {
+                    log('All bytes received (by byte count)', 'success');
+                    eofReceived = true;
+                    tryFinish();
                 }
             };
 
             channel.onclose = () => {
                 log('DataChannel CLOSED', 'info');
-                finishDownload();
+                // Treat channel close as implicit EOF.
+                eofReceived = true;
+                tryFinish();
             };
 
             channel.onerror = (err) => {
-                log(`DataChannel Error: ${err.message}`, 'error');
+                log(`DataChannel Error: ${err.message || err}`, 'error');
             };
         }
 
-        function finishDownload() {
-            const duration = ((Date.now() - startTime) / 1000).toFixed(2);
-            log(`Transfer complete in ${duration}s`, 'success');
-            
-            if (chunks.length === 0) {
-                log('No data received', 'warn');
+        /** Assemble received chunks in offset order and offer download. */
+        function tryFinish() {
+            if (finished) return;
+            if (!eofReceived) return;
+
+            if (fileTotal <= 0) {
+                log('EOF received but file size unknown yet — waiting...', 'warn');
+                return;
+            }
+            if (receivedBytes < fileTotal) {
+                log(`EOF received but missing data — ${receivedBytes} / ${fileTotal} bytes`, 'warn');
                 return;
             }
 
-            const blob = new Blob(chunks, { type: 'application/octet-stream' });
+            if (chunkMap.size === 0) {
+                log('No data received', 'warn');
+                startBtn.disabled = false;
+                return;
+            }
+
+            // Sort chunks by offset and validate contiguity.
+            const sortedOffsets = Array.from(chunkMap.keys()).sort((a, b) => a - b);
+            if (sortedOffsets[0] !== 0) {
+                log(`Missing first chunk at offset 0 (got ${sortedOffsets[0]}) — waiting...`, 'warn');
+                return;
+            }
+
+            let expected = 0;
+            const parts = [];
+            for (const off of sortedOffsets) {
+                const payload = chunkMap.get(off);
+                if (!payload) continue;
+                if (off !== expected) {
+                    log(`Hole detected at offset ${expected} (next ${off}) — waiting...`, 'warn');
+                    return;
+                }
+                parts.push(payload);
+                expected += payload.byteLength;
+            }
+
+            if (expected < fileTotal) {
+                log(`Reassembly incomplete — ${expected} / ${fileTotal} bytes`, 'warn');
+                return;
+            }
+
+            finished = true;
+            const duration = ((Date.now() - startTime) / 1000).toFixed(2);
+            log(`Transfer complete in ${duration}s — reassembling ${parts.length} chunks`, 'success');
+
+            const blob = new Blob(parts, { type: 'application/octet-stream' });
             const url = URL.createObjectURL(blob);
-            
+
             downloadLink.href = url;
-            downloadLink.download = metadata ? metadata.filename : 'downloaded_file';
-            downloadLink.textContent = `Save ${metadata ? metadata.filename : 'File'} (${formatSize(receivedBytes)})`;
+            downloadLink.download = fileName || 'downloaded_file';
+            downloadLink.textContent = `Save ${fileName || 'File'} (${formatSize(receivedBytes)})`;
             downloadLink.style.display = 'inline-block';
-            
-            // Auto-click (optional, maybe better to let user click)
-            // downloadLink.click();
-            
+
             startBtn.disabled = false;
         }
 

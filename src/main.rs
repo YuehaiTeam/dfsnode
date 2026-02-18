@@ -224,8 +224,9 @@ fn build_tus_from_config(
     (config, temp_dir)
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+const TOKIO_WORKER_STACK_SIZE: usize = 16 * 1024 * 1024;
+
+fn main() -> anyhow::Result<()> {
     // Install the ring crypto provider before any rustls usage (quinn, tokio-rustls, etc.)
     rustls::crypto::aws_lc_rs::default_provider()
         .install_default()
@@ -237,6 +238,16 @@ async fn main() -> anyhow::Result<()> {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(TOKIO_WORKER_STACK_SIZE)
+        .build()?;
+
+    rt.block_on(async_main())
+}
+
+async fn async_main() -> anyhow::Result<()> {
 
     let args = Args::parse();
     args.validate()?;

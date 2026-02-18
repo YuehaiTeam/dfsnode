@@ -223,8 +223,17 @@ impl RtcManager {
 
         // If we have STUN-discovered public addresses, add a server-reflexive
         // candidate for each so the remote peer can reach us through NAT.
+        let mut srflx_ips: HashSet<std::net::IpAddr> = HashSet::new();
         for public_addr in self.public_addr_rx.borrow().iter() {
             if *public_addr == local_addr {
+                continue;
+            }
+
+            // Only advertise one srflx candidate per public IP. Some NATs
+            // may report different ports over time; keeping multiple srflx
+            // candidates for the same IP can cause unnecessary ICE churn.
+            if !srflx_ips.insert(public_addr.ip()) {
+                debug!("Skipping duplicate srflx candidate IP: {}", public_addr.ip());
                 continue;
             }
             // str0m requires addr and base to be the same IP version.

@@ -1,6 +1,6 @@
 use std::net::{SocketAddr, UdpSocket};
 use std::path::PathBuf;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use str0m::channel::ChannelId;
@@ -13,8 +13,15 @@ use tracing::{debug, info, warn};
 // Constants
 // ---------------------------------------------------------------------------
 
-/// Chunk size for file reads (64 KB).
-const CHUNK_SIZE: usize = 64 * 1024;
+/// Payload bytes per DataChannel message.
+///
+/// With unordered + framing, each message is `8-byte header + payload`.
+/// We set payload to 128KiB-8 and rely on our patched `sctp-proto` default
+/// max message size being 128KiB.
+const CHUNK_PAYLOAD_SIZE: usize = 128 * 1024 - 8;
+
+/// 8-byte binary EOF marker: all 0xFF.
+const EOF_MARKER: [u8; 8] = [0xFF; 8];
 
 /// Limit how many bytes we enqueue into the DataChannel per `poll_outputs` call.
 ///
@@ -59,7 +66,8 @@ const DRAINING_TIMEOUT_SECS: u64 = 10;
 
 /// Items produced by the background file-reader task.
 enum FileChunk {
-    /// A chunk of file data.
+    /// A framed chunk of file data (8-byte header + payload).
+    /// The `Bytes` already contains the header prepended.
     Data(Bytes),
     /// The file has been fully read.
     Eof,
@@ -67,8 +75,13 @@ enum FileChunk {
     Error(String),
 }
 
-/// Spawn an async file-reader task that reads `path` in `CHUNK_SIZE` chunks
+/// Spawn an async file-reader task that reads `path` in `CHUNK_PAYLOAD_SIZE` chunks
 /// and pushes them into a bounded channel.
+///
+/// Each `Data` chunk is pre-framed with an 8-byte header:
+///   bytes 0..4 = offset (u32 big-endian)
+///   bytes 4..8 = total  (u32 big-endian)
+/// followed by the raw file bytes.
 ///
 /// The task stops automatically when the receiver is dropped (send fails).
 ///
@@ -76,6 +89,7 @@ enum FileChunk {
 /// after each chunk is enqueued so it calls `poll_outputs` promptly.
 fn spawn_file_reader(
     path: PathBuf,
+    file_size: u64,
     wake_tx: mpsc::Sender<u64>,
     session_id: u64,
 ) -> mpsc::Receiver<FileChunk> {
@@ -99,11 +113,15 @@ fn spawn_file_reader(
             }
         };
         let mut reader = tokio::io::BufReader::new(file);
-        let mut buf = BytesMut::with_capacity(CHUNK_SIZE);
+        let total = file_size as u32;
+        let mut offset: u32 = 0;
 
         loop {
-            buf.resize(CHUNK_SIZE, 0);
-            match reader.read(&mut buf[..]).await {
+            // Allocate header + payload in one contiguous buffer.
+            let mut buf = BytesMut::with_capacity(8 + CHUNK_PAYLOAD_SIZE);
+            // Reserve 8 bytes for the header (will be filled after reading).
+            buf.resize(8 + CHUNK_PAYLOAD_SIZE, 0);
+            match reader.read(&mut buf[8..]).await {
                 Ok(0) => {
                     let _ = tx.send(FileChunk::Eof).await;
                     // Wake manager for EOF as well.
@@ -111,9 +129,13 @@ fn spawn_file_reader(
                     return;
                 }
                 Ok(n) => {
-                    let chunk = buf.split_to(n).freeze();
-                    // Reserve capacity for next read.
-                    buf.reserve(CHUNK_SIZE);
+                    // Write the 8-byte header: offset (u32 BE) + total (u32 BE).
+                    buf[0..4].copy_from_slice(&offset.to_be_bytes());
+                    buf[4..8].copy_from_slice(&total.to_be_bytes());
+                    // Truncate to actual size: header + bytes read.
+                    buf.truncate(8 + n);
+                    let chunk = buf.freeze();
+                    offset = offset.saturating_add(n as u32);
                     if tx.send(FileChunk::Data(chunk)).await.is_err() {
                         // Receiver dropped — session is gone.
                         return;
@@ -197,7 +219,7 @@ pub struct RtcSession {
     cached_timeout: Option<Instant>,
     /// Whether the file reader has signalled EOF.
     eof_reached: bool,
-    /// Whether the EOF marker JSON has been sent on the DataChannel.
+    /// Whether the binary EOF marker has been sent on the DataChannel.
     eof_marker_sent: bool,
     /// Total bytes written to str0m so far.
     bytes_sent: u64,
@@ -317,22 +339,32 @@ impl RtcSession {
             // current chunk, send the EOF marker and enter Draining.
             if self.eof_reached && self.current_chunk.is_none() && !self.eof_marker_sent {
                 if let Some(cid) = self.channel_id {
-                    info!(
-                        "All file data written to DataChannel ({} bytes) — sending EOF marker, entering Draining",
-                        self.bytes_sent
-                    );
-                    // Send EOF as a text (binary=false) JSON message.
+                    // Send EOF as a binary message: 8 bytes of 0xFF, no payload.
                     if let Some(mut ch) = self.rtc.channel(cid) {
-                        let eof_msg = br#"{"type":"eof"}"#;
-                        if let Err(e) = ch.write(false, eof_msg) {
-                            warn!("Failed to send EOF marker: {e}");
+                        match ch.write(true, &EOF_MARKER) {
+                            Ok(true) => {
+                                self.bytes_sent += EOF_MARKER.len() as u64;
+                                self.last_activity = Instant::now();
+                                self.eof_marker_sent = true;
+                                self.state = SessionState::Draining;
+                                info!(
+                                    "All file data written to DataChannel ({} bytes) — sent EOF marker, entering Draining",
+                                    self.bytes_sent
+                                );
+                                // Drain once more so the EOF marker gets segmented into
+                                // UDP packets immediately.
+                                self.drain_poll_output(udp_tx);
+                            }
+                            Ok(false) => {
+                                // Channel buffer full — retry soon.
+                                self.cached_timeout =
+                                    Some(Instant::now() + Duration::from_millis(10));
+                            }
+                            Err(e) => {
+                                warn!("Failed to send EOF marker: {e}");
+                            }
                         }
                     }
-                    self.eof_marker_sent = true;
-                    self.state = SessionState::Draining;
-                    // Drain once more so the EOF marker gets segmented into
-                    // UDP packets immediately.
-                    self.drain_poll_output(udp_tx);
                 }
             }
         }
@@ -426,15 +458,13 @@ impl RtcSession {
                     ch.set_buffered_amount_low_threshold(LOW_WATERMARK);
                 }
 
-                // Spawn the async file reader task.
+                // Spawn the async file reader task (produces pre-framed chunks).
                 self.chunk_rx = Some(spawn_file_reader(
                     self.file_path.clone(),
+                    self.file_size,
                     self.wake_tx.clone(),
                     self.session_id,
                 ));
-
-                // Send metadata first (uses pre-collected file_size).
-                self.send_metadata();
             }
 
             Event::ChannelData(_data) => {
@@ -464,44 +494,12 @@ impl RtcSession {
     // File transfer
     // ------------------------------------------------------------------
 
-    /// Send a JSON metadata header as a text message on the DataChannel.
+    /// Consume pre-framed chunks from the async file reader and write them
+    /// into str0m, respecting the high watermark for backpressure.
     ///
-    /// Format: `{"filename": "<name>", "size": <bytes>}`
-    fn send_metadata(&mut self) {
-        let Some(cid) = self.channel_id else { return };
-
-        let filename = self
-            .file_path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "unknown".to_string());
-
-        let json = serde_json::json!({
-            "filename": filename,
-            "size": self.file_size,
-        });
-        let json_bytes = json.to_string().into_bytes();
-
-        // Send as text (binary = false).
-        match self.rtc.channel(cid) {
-            Some(mut ch) => {
-                if let Err(e) = ch.write(false, &json_bytes) {
-                    warn!("Failed to send metadata: {e}");
-                    self.state = SessionState::Failed;
-                }
-            }
-            None => {
-                warn!("Channel {cid:?} not available for metadata send");
-                self.state = SessionState::Failed;
-            }
-        }
-    }
-
-    /// Consume chunks from the async file reader and write them into str0m,
-    /// respecting the high watermark for backpressure.
-    ///
-    /// Uses a `current_chunk: Option<Bytes>` + `current_off: usize` cursor
-    /// to avoid any Vec cloning on partial writes.
+    /// Each chunk from the reader already contains the 8-byte binary header
+    /// (offset + total) followed by file data.  `ch.write(true, …)` sends
+    /// the entire framed message as a single binary DataChannel message.
     ///
     /// After each batch of writes, re-drains `poll_output()` so new SCTP
     /// payloads are immediately segmented into UDP packets.
@@ -579,6 +577,7 @@ impl RtcSession {
                     }
                     Ok(true) => {
                         // str0m v0.16 write is all-or-nothing.
+                        // Framed message includes 8-byte header; count the full message.
                         self.bytes_sent += remaining.len() as u64;
                         self.last_activity = Instant::now();
                         did_write = true;

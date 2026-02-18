@@ -210,6 +210,17 @@ impl StunDemuxSocket {
         if let Some(public_addr) = protocol::parse_binding_response(data) {
             // Add to the set of discovered public addresses
             self.public_addr_tx.send_if_modified(|current| {
+                // Only track changes when the public IP changes.
+                // Some NATs may vary the observed port over time even when the IP is stable;
+                // updating srflx candidates on port-only changes can cause jitter in the
+                // WebRTC stack, so we keep the first-seen port per IP.
+                if current.iter().any(|a| a.ip() == public_addr.ip()) {
+                    trace!(
+                        "STUN public IP unchanged (ignoring port-only update): {public_addr}"
+                    );
+                    return false;
+                }
+
                 if current.insert(public_addr) {
                     info!("STUN discovered public address: {public_addr}");
                     true
