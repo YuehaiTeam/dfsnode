@@ -87,13 +87,15 @@ uuid = { version = "1", features = ["v4"] }
 reqwest = { version = "0.13.2" }
 url = "2"
 
-# Self-signed certificate generation
+# Self-signed certificate generation & validation
 rcgen = { version = "0.14", features = [
     "crypto",
     "pem",
     "aws_lc_rs",
 ], default-features = false }
 arc-swap = "1"
+x509-parser = "0.17"
+rustls-native-certs = "0.8"
 
 # WebRTC DataChannel (Sans-I/O)
 str0m = { version = "0.16.2", default-features = true }

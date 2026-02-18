@@ -2,6 +2,7 @@ mod auth;
 mod config;
 mod dav;
 mod metrics;
+mod panic_recovery;
 mod rtc;
 mod server;
 mod stun;
@@ -297,7 +298,7 @@ async fn async_main() -> anyhow::Result<()> {
     // Spawn TUS cleanup task if enabled
     if let Some(ref mgr) = tus_manager {
         let cleanup_mgr = mgr.clone();
-        tokio::spawn(async move {
+        panic_recovery::spawn_catch_panic("tus-cleanup", async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
             loop {
                 interval.tick().await;
@@ -347,6 +348,16 @@ async fn async_main() -> anyhow::Result<()> {
         if let (Some(cert_path), Some(key_path)) = (&args.cert, &args.key) {
             let cert = PathBuf::from(cert_path);
             let key = PathBuf::from(key_path);
+
+            // --ssl-generate: check cert validity & system trust, regenerate if needed
+            if args.ssl_generate {
+                match server::ssl_generate::maybe_regenerate_cert(&cert, &key) {
+                    Ok(true) => info!("Certificate was regenerated"),
+                    Ok(false) => {}
+                    Err(e) => tracing::warn!("Certificate check failed: {e}"),
+                }
+            }
+
             info!("Using TLS certificate from: {}", cert.display());
             Some(TlsSource::File { cert, key })
         } else {
@@ -420,7 +431,7 @@ async fn async_main() -> anyhow::Result<()> {
     // HTTP server
     if let Some(port) = args.http_port {
         let http_app = app.clone().layer(server::metrics_layer::MetricsLayer::new("http"));
-        handles.push(tokio::spawn(async move {
+        handles.push(panic_recovery::spawn_catch_panic("http-server", async move {
             if let Err(e) = server::http::serve(port, http_app).await {
                 tracing::error!("HTTP server error: {e}");
             }
@@ -436,7 +447,7 @@ async fn async_main() -> anyhow::Result<()> {
                 server::selfsign::build_https_config_dynamic(resolver.clone())
             }
         };
-        handles.push(tokio::spawn(async move {
+        handles.push(panic_recovery::spawn_catch_panic("https-server", async move {
             if let Err(e) = server::https::serve(port, https_config, https_app).await {
                 tracing::error!("HTTPS server error: {e}");
             }
@@ -468,7 +479,7 @@ async fn async_main() -> anyhow::Result<()> {
         let webhook_url = args.webhook_url.clone().or_else(|| {
             file_config.as_ref().and_then(|fc| fc.webhook_url.clone())
         });
-        tokio::spawn(async move {
+        panic_recovery::spawn_catch_panic("addr-watcher", async move {
             // Build a reusable HTTP client for webhook calls
             let webhook_client = webhook_url.as_deref().map(|raw_url| {
                 build_webhook_client(raw_url)
@@ -517,11 +528,11 @@ async fn async_main() -> anyhow::Result<()> {
                 cmd_rx,
             );
 
-            tokio::spawn(manager.run());
+            panic_recovery::spawn_catch_panic("rtc-manager", manager.run());
             info!("WebRTC DataChannel enabled (LOCK method signaling)");
         }
 
-        handles.push(tokio::spawn(async move {
+        handles.push(panic_recovery::spawn_catch_panic("h3-server", async move {
             if let Err(e) = h3_handle.task.await {
                 tracing::error!("HTTP/3 server error: {e}");
             }

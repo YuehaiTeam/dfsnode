@@ -4,5 +4,6 @@ pub mod https;
 pub mod metrics_body;
 pub mod metrics_layer;
 pub mod selfsign;
+pub mod ssl_generate;
 pub mod tls;
 pub mod webtransport;

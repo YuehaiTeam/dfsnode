@@ -39,6 +39,12 @@ pub fn spawn(
     // Allow unidirectional streams for WebTransport server→client file push
     transport.max_concurrent_uni_streams(16_u16.into());
     transport.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
+    // Disable PMTUD and fix MTU at the QUIC minimum (1200).  Our connections
+    // are short-lived (single file transfer) so probing gains little, and
+    // IPv6 path MTU variance causes sporadic WSAEMSGSIZE / silent drops that
+    // quinn's PMTUD may not recover from quickly enough.
+    transport.mtu_discovery_config(None);
+    transport.initial_mtu(1200);
     server_config.transport_config(Arc::new(transport));
 
     let addr: SocketAddr = format!("[::]:{port}").parse()?;
@@ -53,6 +59,10 @@ pub fn spawn(
             let sock = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
             sock.set_only_v6(false)?;
             sock.set_nonblocking(true)?;
+            // Enlarge send buffer to reduce WSAEWOULDBLOCK (10035) under
+            // bursty WebRTC + QUIC traffic on the shared socket.
+            sock.set_send_buffer_size(4096 * 1024)?; // 512 KiB
+            sock.set_recv_buffer_size(4096 * 1024)?; // 512 KiB
             sock.bind(&addr.into())?;
             std::net::UdpSocket::from(sock)
         };
@@ -86,7 +96,7 @@ pub fn spawn(
         while let Some(incoming) = endpoint.accept().await {
             let app = app.clone();
             let wt_config = wt_config.clone();
-            tokio::spawn(async move {
+            crate::panic_recovery::spawn_catch_panic("h3-conn", async move {
                 if let Err(e) = handle_connection(incoming, app, wt_config).await {
                     debug!("HTTP/3 connection error: {e}");
                 }
@@ -140,7 +150,7 @@ async fn handle_connection(
 
         // Normal H3 request — dispatch through axum
         let app = app.clone();
-        tokio::spawn(async move {
+        crate::panic_recovery::spawn_catch_panic("h3-request", async move {
             if let Err(e) = handle_request(req, stream, app).await {
                 debug!("HTTP/3 request error: {e}");
             }

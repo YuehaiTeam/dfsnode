@@ -90,6 +90,13 @@ pub struct Args {
     /// and TCP connections are only used for signaling (e.g. via frp tunnel).
     #[arg(long, default_value_t = false)]
     pub no_tcp_download: bool,
+
+    /// Auto-generate TLS certificate when the existing one is untrusted
+    /// by the system AND has less than 1 day of validity remaining.
+    /// Requires --cert and --key to specify output paths.
+    /// If the cert file does not exist, a new self-signed certificate is created.
+    #[arg(long, default_value_t = false)]
+    pub ssl_generate: bool,
 }
 
 impl Args {
@@ -150,6 +157,11 @@ impl Args {
         // --no-tcp-download requires --enable-rtc or --http3-port (otherwise no download path remains)
         if self.no_tcp_download && self.http3_port.is_none() {
             anyhow::bail!("--no-tcp-download requires --http3-port (otherwise no download method is available)");
+        }
+
+        // --ssl-generate requires --cert and --key
+        if self.ssl_generate && (self.cert.is_none() || self.key.is_none()) {
+            anyhow::bail!("--ssl-generate requires --cert and --key to specify output paths");
         }
 
         Ok(())

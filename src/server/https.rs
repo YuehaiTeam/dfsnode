@@ -26,7 +26,7 @@ pub async fn serve(
         let tls_acceptor = tls_acceptor.clone();
         let app = app.clone();
 
-        tokio::spawn(async move {
+        crate::panic_recovery::spawn_catch_panic("https-conn", async move {
             let tls_stream = match tls_acceptor.accept(tcp_stream).await {
                 Ok(s) => s,
                 Err(e) => {

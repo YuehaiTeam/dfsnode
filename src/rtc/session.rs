@@ -35,7 +35,7 @@ const MAX_WRITE_PER_CYCLE: usize = 512 * 1024;
 /// On `str0m` v0.15, `poll_output()` can recurse internally when SCTP has a
 /// large amount of work to flush (e.g. after retransmits). Draining unboundedly
 /// increases the risk of stack overflow.
-const MAX_POLL_OUTPUTS_PER_DRAIN: usize = 2048;
+const MAX_POLL_OUTPUTS_PER_DRAIN: usize = 4096;
 
 /// High watermark: stop injecting when `buffered_amount()` >= this value.
 const HIGH_WATERMARK: usize = 4 * 1024 * 1024;
@@ -94,7 +94,7 @@ fn spawn_file_reader(
     session_id: u64,
 ) -> mpsc::Receiver<FileChunk> {
     let (tx, rx) = mpsc::channel(FILE_READER_CHANNEL_CAP);
-    tokio::spawn(async move {
+    crate::panic_recovery::spawn_catch_panic("rtc-file-reader", async move {
         use bytes::BytesMut;
         use tokio::io::AsyncReadExt;
 

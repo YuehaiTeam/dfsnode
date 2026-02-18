@@ -574,6 +574,7 @@ dependencies = [
  "rcgen",
  "reqwest",
  "rustls",
+ "rustls-native-certs",
  "rustls-pemfile",
  "serde",
  "serde_json",
@@ -591,6 +592,7 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "uuid",
+ "x509-parser 0.17.0",
 ]
 
 [[package]]
@@ -1873,7 +1875,7 @@ dependencies = [
  "pem",
  "rustls-pki-types",
  "time",
- "x509-parser",
+ "x509-parser 0.18.1",
  "yasna",
 ]
 
@@ -3546,6 +3548,23 @@ dependencies = [
  "const-oid",
  "der",
  "spki",
+]
+
+[[package]]
+name = "x509-parser"
+version = "0.17.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4569f339c0c402346d4a75a9e39cf8dad310e287eef1ff56d4c68e5067f53460"
+dependencies = [
+ "asn1-rs",
+ "data-encoding",
+ "der-parser",
+ "lazy_static",
+ "nom",
+ "oid-registry",
+ "rusticata-macros",
+ "thiserror 2.0.18",
+ "time",
 ]
 
 [[package]]
