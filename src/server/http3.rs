@@ -16,6 +16,9 @@ pub struct Http3Handle {
     pub task: tokio::task::JoinHandle<anyhow::Result<()>>,
     pub public_addr: watch::Receiver<Option<SocketAddr>>,
     pub endpoint: quinn::Endpoint,
+    /// Cloned raw UDP socket for RtcManager to send packets.
+    /// Only available when STUN is enabled.
+    pub udp_socket: Option<Arc<std::net::UdpSocket>>,
 }
 
 /// Spawn an HTTP/3 (QUIC) server, optionally with STUN NAT traversal.
@@ -25,6 +28,7 @@ pub fn spawn(
     app: Router,
     stun_config: Option<StunConfig>,
     wt_config: WtConfig,
+    rtc_packet_tx: Option<tokio::sync::mpsc::Sender<(Vec<u8>, SocketAddr)>>,
 ) -> anyhow::Result<Http3Handle> {
     let quic_server_config =
         quinn::crypto::rustls::QuicServerConfig::try_from(rustls_config)?;
@@ -38,12 +42,15 @@ pub fn spawn(
     let addr: SocketAddr = format!("[::]:{port}").parse()?;
 
     // Build endpoint with or without STUN
-    let (endpoint, public_addr_rx) = if let Some(stun_cfg) = stun_config {
+    let (endpoint, public_addr_rx, udp_socket_for_rtc) = if let Some(stun_cfg) = stun_config {
         let raw_socket = std::net::UdpSocket::bind(addr)?;
         raw_socket.set_nonblocking(true)?;
 
+        // Clone for RtcManager sending (before moving into stun setup)
+        let rtc_udp_socket = Arc::new(raw_socket.try_clone()?);
+
         let runtime: Arc<dyn quinn::Runtime> = Arc::new(quinn::TokioRuntime);
-        let stun_setup = stun::setup_stun_socket(raw_socket, stun_cfg, &runtime)?;
+        let stun_setup = stun::setup_stun_socket(raw_socket, stun_cfg, &runtime, rtc_packet_tx)?;
 
         let endpoint = quinn::Endpoint::new_with_abstract_socket(
             quinn::EndpointConfig::default(),
@@ -55,12 +62,12 @@ pub fn spawn(
         stun::spawn_stun_keepalive(stun_setup.keepalive_socket, stun_setup.config);
 
         info!("HTTP/3 server listening on https://{addr} (QUIC/UDP) with STUN NAT traversal");
-        (endpoint, stun_setup.public_addr_rx)
+        (endpoint, stun_setup.public_addr_rx, Some(rtc_udp_socket))
     } else {
         let endpoint = quinn::Endpoint::server(server_config, addr)?;
         let (_, rx) = watch::channel(None);
         info!("HTTP/3 server listening on https://{addr} (QUIC/UDP)");
-        (endpoint, rx)
+        (endpoint, rx, None)
     };
 
     let endpoint_handle = endpoint.clone();
@@ -81,6 +88,7 @@ pub fn spawn(
         task,
         public_addr: public_addr_rx,
         endpoint: endpoint_handle,
+        udp_socket: udp_socket_for_rtc,
     })
 }
 

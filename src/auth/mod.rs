@@ -37,6 +37,8 @@ pub struct AuthConfig {
     sign_overrides: Vec<(String, SignRule)>,
     /// The URL prefix to strip when computing the DAV path.
     prefix: String,
+    /// When true, block GET downloads via HTTP/1.1 and HTTP/2 (H3 unaffected).
+    pub no_tcp_download: bool,
 }
 
 impl AuthConfig {
@@ -95,6 +97,7 @@ impl AuthConfig {
 }
 
 /// Unified auth middleware:
+/// - --no-tcp-download: block GET downloads via H1/H2 (non-management paths)
 /// - GET requests: check per-path overrides first, then global signature, then basic auth
 /// - Non-GET: basic auth only
 pub async fn auth_middleware(
@@ -102,6 +105,21 @@ pub async fn auth_middleware(
     req: Request,
     next: Next,
 ) -> Response {
+    // Block H1/H2 GET downloads when --no-tcp-download is active.
+    // Management paths (/-/) and non-GET methods are always allowed.
+    // H3 requests never reach this middleware (they go through Quinn, not TCP listener).
+    if config.no_tcp_download
+        && req.method() == http::Method::GET
+        && !req.uri().path().starts_with("/-/")
+    {
+        return (
+            StatusCode::METHOD_NOT_ALLOWED,
+            [(http::header::ALLOW, "PROPFIND, LOCK, OPTIONS, HEAD")],
+            "TCP downloads disabled. Use H3, WebTransport, or WebRTC.",
+        )
+            .into_response();
+    }
+
     if req.method() == http::Method::GET {
         let uri_path = req.uri().path();
 
@@ -227,6 +245,7 @@ pub fn build_auth_from_args(args: &Args) -> AuthConfig {
             .map(|key| Arc::new(SignatureVerifier::new(key))),
         sign_overrides: Vec::new(),
         prefix: args.prefix.clone(),
+        no_tcp_download: args.no_tcp_download,
     }
 }
 
@@ -279,5 +298,6 @@ pub fn build_auth_from_config(file_config: &FileConfig, prefix: &str) -> AuthCon
         sign_global,
         sign_overrides,
         prefix: prefix.to_string(),
+        no_tcp_download: false,
     }
 }

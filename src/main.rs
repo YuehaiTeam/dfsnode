@@ -1,6 +1,7 @@
 mod auth;
 mod config;
 mod dav;
+mod rtc;
 mod server;
 mod stun;
 mod tus;
@@ -122,11 +123,15 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // Build auth
-    let auth = if let Some(ref fc) = file_config {
+    let mut auth = if let Some(ref fc) = file_config {
         build_auth_from_config(fc, &args.prefix)
     } else {
         build_auth_from_args(&args)
     };
+    // Override no_tcp_download from CLI (config file doesn't have this setting)
+    if args.no_tcp_download {
+        auth.no_tcp_download = true;
+    }
 
     // Build TUS manager (if configured)
     let tus_manager: Option<Arc<TusUploadManager>> = if let Some(ref fc) = file_config {
@@ -212,6 +217,48 @@ async fn main() -> anyhow::Result<()> {
     let mut handles = Vec::new();
     let mut h3_endpoint: Option<quinn::Endpoint> = None;
 
+    // -------------------------------------------------------------------
+    // WebRTC DataChannel setup (before server spawning so all servers
+    // get the LOCK routes).
+    // -------------------------------------------------------------------
+    let rtc_packet_tx = if args.enable_rtc {
+        Some(tokio::sync::mpsc::channel::<(Vec<u8>, std::net::SocketAddr)>(1024))
+    } else {
+        None
+    };
+    let (rtc_tx_for_h3, rtc_rx_for_manager) = match rtc_packet_tx {
+        Some((tx, rx)) => (Some(tx), Some(rx)),
+        None => (None, None),
+    };
+
+    // If RTC is enabled, we'll create the RtcHandle now (via a oneshot pattern)
+    // and merge LOCK routes into the app.  The RtcManager itself is spawned
+    // later once we have the UDP socket + public_addr_rx from the H3 server.
+    let (rtc_handle_holder, rtc_rx_holder) = if let Some(rtc_rx) = rtc_rx_for_manager {
+        // Create a placeholder RtcManager with a dummy socket — we'll replace
+        // the actual manager in the spawn block once we have the real socket.
+        // Instead, use a deferred pattern: create command channels now, wire
+        // the RtcManager later.
+        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel::<rtc::CreateSessionCmd>(32);
+        let handle = rtc::RtcHandle::new(cmd_tx);
+        (Some(handle), Some((cmd_rx, rtc_rx)))
+    } else {
+        (None, None)
+    };
+
+    // Merge LOCK routes into app if RTC is enabled.
+    let app = if let Some(ref rtc_handle) = rtc_handle_holder {
+        let rtc_state = rtc::handler::RtcState {
+            rtc_handle: rtc_handle.clone(),
+            root: root.clone(),
+            prefix: args.prefix.clone(),
+        };
+        let lock_router = rtc::handler::lock_routes(&args.prefix, rtc_state);
+        app.merge(lock_router)
+    } else {
+        app
+    };
+
     // HTTP server
     if let Some(port) = args.http_port {
         let app = app.clone();
@@ -252,10 +299,13 @@ async fn main() -> anyhow::Result<()> {
             root: root.clone(),
             prefix: args.prefix.clone(),
         };
-        let h3_handle = server::http3::spawn(port, quic_config, app, stun_config, wt_config)?;
+        let h3_handle = server::http3::spawn(port, quic_config, app, stun_config, wt_config, rtc_tx_for_h3)?;
 
         // Log public address discovery in background (if STUN enabled)
-        // and optionally notify via webhook
+        // and optionally notify via webhook.
+        // Clone the receiver before moving into the webhook task so the
+        // RtcManager can also observe public address changes.
+        let public_addr_for_rtc = h3_handle.public_addr.clone();
         let mut public_addr_rx = h3_handle.public_addr;
         let webhook_url = args.webhook_url.clone().or_else(|| {
             file_config.as_ref().and_then(|fc| fc.webhook_url.clone())
@@ -294,6 +344,23 @@ async fn main() -> anyhow::Result<()> {
         });
 
         h3_endpoint = Some(h3_handle.endpoint);
+
+        // Spawn RtcManager if WebRTC is enabled
+        if let Some((cmd_rx, rtc_rx)) = rtc_rx_holder {
+            let udp_tx = h3_handle
+                .udp_socket
+                .expect("WebRTC requires STUN — udp_socket must be present");
+
+            let manager = rtc::RtcManager::from_parts(
+                udp_tx,
+                public_addr_for_rtc,
+                rtc_rx,
+                cmd_rx,
+            );
+
+            tokio::spawn(manager.run());
+            info!("WebRTC DataChannel enabled (LOCK method signaling)");
+        }
 
         handles.push(tokio::spawn(async move {
             if let Err(e) = h3_handle.task.await {

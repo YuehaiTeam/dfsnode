@@ -78,6 +78,18 @@ pub struct Args {
     /// The public address (ip:port) is sent as POST body in plain text.
     #[arg(long)]
     pub webhook_url: Option<String>,
+
+    /// Enable WebRTC DataChannel file transfer via LOCK method signaling.
+    /// Requires --http3-port with --stun-server for public address discovery.
+    #[arg(long, default_value_t = false)]
+    pub enable_rtc: bool,
+
+    /// Disable file downloads via HTTP/1.1 and HTTP/2 GET requests.
+    /// H3 and WebTransport downloads are not affected.
+    /// Useful when WebRTC DataChannel is the preferred download method
+    /// and TCP connections are only used for signaling (e.g. via frp tunnel).
+    #[arg(long, default_value_t = false)]
+    pub no_tcp_download: bool,
 }
 
 impl Args {
@@ -123,6 +135,21 @@ impl Args {
         // --stun-interval-secs must be positive
         if let Some(0) = self.stun_interval_secs {
             anyhow::bail!("--stun-interval-secs must be greater than 0");
+        }
+
+        // --enable-rtc requires --http3-port and --stun-server
+        if self.enable_rtc {
+            if self.http3_port.is_none() {
+                anyhow::bail!("--enable-rtc requires --http3-port to be specified");
+            }
+            if self.stun_server.is_none() {
+                anyhow::bail!("--enable-rtc requires --stun-server for public address discovery");
+            }
+        }
+
+        // --no-tcp-download requires --enable-rtc or --http3-port (otherwise no download path remains)
+        if self.no_tcp_download && self.http3_port.is_none() {
+            anyhow::bail!("--no-tcp-download requires --http3-port (otherwise no download method is available)");
         }
 
         Ok(())

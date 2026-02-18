@@ -4,6 +4,10 @@
 //! intercept STUN Binding Responses on the same UDP port used for QUIC,
 //! plus a keepalive task that periodically sends STUN Binding Requests to
 //! maintain the NAT mapping.
+//!
+//! When WebRTC is enabled, also demuxes ICE STUN (first byte 0–3 from
+//! non-STUN-server sources) and DTLS (first byte 20–63) packets to the
+//! RtcManager via an mpsc channel.
 
 pub mod protocol;
 
@@ -45,7 +49,8 @@ pub struct StunSetup {
 ///
 /// 1. Clones the raw socket (for the keepalive sender).
 /// 2. Wraps the original via `runtime.wrap_udp_socket()`.
-/// 3. Wraps that in a [`StunDemuxSocket`] that intercepts STUN responses.
+/// 3. Wraps that in a [`StunDemuxSocket`] that intercepts STUN responses
+///    and optionally routes ICE/DTLS packets to the RtcManager.
 ///
 /// Returns a [`StunSetup`] containing everything needed to start the
 /// keepalive task and hand the socket to Quinn.
@@ -53,6 +58,7 @@ pub fn setup_stun_socket(
     raw_socket: std::net::UdpSocket,
     config: StunConfig,
     runtime: &Arc<dyn quinn::Runtime>,
+    rtc_packet_tx: Option<tokio::sync::mpsc::Sender<(Vec<u8>, SocketAddr)>>,
 ) -> io::Result<StunSetup> {
     // Clone for the keepalive sender (uses the same local port / NAT mapping)
     let keepalive_socket = raw_socket.try_clone()?;
@@ -67,6 +73,7 @@ pub fn setup_stun_socket(
         inner,
         stun_server: config.server,
         public_addr_tx: pub_addr_tx,
+        rtc_packet_tx,
     });
 
     Ok(StunSetup {
@@ -120,13 +127,17 @@ pub fn spawn_stun_keepalive(
 /// STUN Binding Responses from the configured STUN server before they reach
 /// Quinn's QUIC stack.
 ///
-/// All non-STUN packets are passed through unchanged. When a STUN response
-/// is detected, its XOR-MAPPED-ADDRESS is extracted and published via the
-/// `watch` channel.
+/// When WebRTC is enabled, also routes:
+/// - ICE STUN packets (first byte 0–3 from non-STUN-server) → RtcManager
+/// - DTLS packets (first byte 20–63) → RtcManager
+/// - QUIC packets (first byte 64–255) → Quinn
 struct StunDemuxSocket {
     inner: Arc<dyn AsyncUdpSocket>,
     stun_server: SocketAddr,
     public_addr_tx: watch::Sender<Option<SocketAddr>>,
+    /// Channel to forward ICE STUN and DTLS packets to the RtcManager.
+    /// None when WebRTC is disabled.
+    rtc_packet_tx: Option<tokio::sync::mpsc::Sender<(Vec<u8>, SocketAddr)>>,
 }
 
 impl fmt::Debug for StunDemuxSocket {
@@ -169,6 +180,44 @@ impl StunDemuxSocket {
             true // still consume it — don't let Quinn see garbage from the STUN server
         }
     }
+
+    /// Classify a packet and decide where to route it.
+    /// Returns `true` if the packet was consumed (should NOT go to Quinn).
+    fn try_route_packet(&self, data: &[u8], source: SocketAddr) -> bool {
+        if data.is_empty() {
+            return false;
+        }
+
+        let first_byte = data[0];
+
+        // STUN range: first byte 0–3
+        if first_byte <= 3 {
+            // From our STUN server → handle as NAT traversal response
+            if source == self.stun_server {
+                return self.try_handle_stun(data, source);
+            }
+            // From other source → ICE connectivity check → route to RtcManager
+            if let Some(ref tx) = self.rtc_packet_tx {
+                let _ = tx.try_send((data.to_vec(), source));
+                return true;
+            }
+            // No RTC enabled — let Quinn handle it (it'll ignore it)
+            return false;
+        }
+
+        // DTLS range: first byte 20–63 → route to RtcManager
+        if (20..=63).contains(&first_byte) {
+            if let Some(ref tx) = self.rtc_packet_tx {
+                let _ = tx.try_send((data.to_vec(), source));
+                return true;
+            }
+            // No RTC enabled — drop DTLS packets
+            return true;
+        }
+
+        // QUIC range: first byte 64–255 → pass to Quinn
+        false
+    }
 }
 
 impl AsyncUdpSocket for StunDemuxSocket {
@@ -198,11 +247,11 @@ impl AsyncUdpSocket for StunDemuxSocket {
                 return Poll::Ready(Ok(0));
             }
 
-            // Filter out STUN packets, compact remaining QUIC packets
+            // Filter out STUN/ICE/DTLS packets, compact remaining QUIC packets
             let mut write_idx = 0;
             for read_idx in 0..n {
                 let data = &bufs[read_idx][..meta[read_idx].len];
-                if self.try_handle_stun(data, meta[read_idx].addr) {
+                if self.try_route_packet(data, meta[read_idx].addr) {
                     // Consumed — don't forward to Quinn
                     continue;
                 }
@@ -218,10 +267,7 @@ impl AsyncUdpSocket for StunDemuxSocket {
                 return Poll::Ready(Ok(write_idx));
             }
 
-            // ALL packets in this batch were STUN — loop back to recv more.
-            // The inner socket's waker is already registered from the
-            // poll_recv call above, so we'll be woken when more data arrives.
-            // But we need to re-poll since we consumed everything.
+            // ALL packets in this batch were consumed — loop back to recv more.
             continue;
         }
     }

@@ -77,5 +77,11 @@ url = "2"
 rcgen = { version = "0.13", features = ["ring"] }
 arc-swap = "1"
 
+# WebRTC DataChannel (Sans-I/O)
+str0m = { version = "0.15", default-features = true }
+
 # Error handling
 anyhow = "1"
+
+[profile.dev]
+debug = "line-tables-only"
