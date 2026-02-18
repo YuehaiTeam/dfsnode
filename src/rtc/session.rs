@@ -17,7 +17,7 @@ use tracing::{debug, info, warn};
 const CHUNK_SIZE: usize = 64 * 1024;
 
 /// High watermark: stop injecting when `buffered_amount()` >= this value.
-const HIGH_WATERMARK: usize = 256 * 1024;
+const HIGH_WATERMARK: usize = 4 * 1024 * 1024;
 
 /// Low watermark: set as the `buffered_amount_low_threshold` so str0m
 /// fires `Event::ChannelBufferedAmountLow` when buffered drops below this.
@@ -301,10 +301,7 @@ impl RtcSession {
 
             // Once the file reader is finished AND there is no remaining
             // current chunk, send the EOF marker and enter Draining.
-            if self.eof_reached
-                && self.current_chunk.is_none()
-                && !self.eof_marker_sent
-            {
+            if self.eof_reached && self.current_chunk.is_none() && !self.eof_marker_sent {
                 if let Some(cid) = self.channel_id {
                     info!(
                         "All file data written to DataChannel ({} bytes) — sending EOF marker, entering Draining",
