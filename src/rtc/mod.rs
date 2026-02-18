@@ -107,6 +107,11 @@ pub struct RtcManager {
     cmd_rx: mpsc::Receiver<CreateSessionCmd>,
     /// Auto-incrementing session ID counter.
     next_session_id: u64,
+    /// Sender half of the wake channel — cloned into every `RtcSession` /
+    /// file-reader so they can nudge this manager when new data is ready.
+    wake_tx: mpsc::Sender<u64>,
+    /// Receiver half of the wake channel — polled in `run()`.
+    wake_rx: mpsc::Receiver<u64>,
 }
 
 impl RtcManager {
@@ -123,6 +128,8 @@ impl RtcManager {
         rtc_packet_rx: mpsc::Receiver<(Vec<u8>, SocketAddr)>,
     ) -> (Self, RtcHandle) {
         let (cmd_tx, cmd_rx) = mpsc::channel(32);
+        // Wake channel: bounded(8) — small capacity; try_send coalesces naturally.
+        let (wake_tx, wake_rx) = mpsc::channel(8);
         let manager = Self {
             sessions: HashMap::new(),
             addr_map: HashMap::new(),
@@ -131,6 +138,8 @@ impl RtcManager {
             rtc_packet_rx,
             cmd_rx,
             next_session_id: 1,
+            wake_tx,
+            wake_rx,
         };
         let handle = RtcHandle { cmd_tx };
         (manager, handle)
@@ -146,6 +155,8 @@ impl RtcManager {
         rtc_packet_rx: mpsc::Receiver<(Vec<u8>, SocketAddr)>,
         cmd_rx: mpsc::Receiver<CreateSessionCmd>,
     ) -> Self {
+        // Wake channel: bounded(8) — small capacity; try_send coalesces naturally.
+        let (wake_tx, wake_rx) = mpsc::channel(8);
         Self {
             sessions: HashMap::new(),
             addr_map: HashMap::new(),
@@ -154,6 +165,8 @@ impl RtcManager {
             rtc_packet_rx,
             cmd_rx,
             next_session_id: 1,
+            wake_tx,
+            wake_rx,
         }
     }
 
@@ -284,7 +297,7 @@ impl RtcManager {
             })
             .collect();
 
-        let session = RtcSession::new(rtc, file_path, file_size, local_addr, candidate_addrs);
+        let session = RtcSession::new(rtc, session_id, file_path, file_size, local_addr, candidate_addrs, self.wake_tx.clone());
         self.sessions.insert(session_id, session);
 
         info!("Created RTC session {session_id}");
@@ -348,6 +361,14 @@ impl RtcManager {
                             // Channel closed — shut down.
                             info!("RTC packet channel closed — shutting down RtcManager");
                             break;
+                        }
+                    }
+                }
+                // File-reader produced new data — drive the session.
+                wake_sid = self.wake_rx.recv() => {
+                    if let Some(sid) = wake_sid {
+                        if let Some(session) = self.sessions.get_mut(&sid) {
+                            session.poll_outputs(&self.udp_tx);
                         }
                     }
                 }

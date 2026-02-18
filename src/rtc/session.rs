@@ -79,6 +79,8 @@ fn spawn_file_reader(
                         path.display()
                     )))
                     .await;
+                // Wake manager so the session can observe the error.
+                let _ = wake_tx.try_send(session_id);
                 return;
             }
         };
@@ -110,6 +112,8 @@ fn spawn_file_reader(
                     let _ = tx
                         .send(FileChunk::Error(format!("File read error: {e}")))
                         .await;
+                    // Wake manager so the session can observe the error.
+                    let _ = wake_tx.try_send(session_id);
                     return;
                 }
             }
