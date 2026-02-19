@@ -62,6 +62,11 @@ impl AuthConfig {
         self.basic.is_some()
     }
 
+    /// Whether any authentication is configured (basic-auth or signature rules).
+    pub fn has_any_auth(&self) -> bool {
+        self.basic.is_some() || self.sign_global.is_some() || !self.sign_overrides.is_empty()
+    }
+
     /// Get the basic auth password (used as JWT secret for MinIO-compatible metrics).
     pub fn basic_password(&self) -> Option<&str> {
         self.basic.as_ref().map(|b| b.password())
@@ -81,7 +86,7 @@ impl AuthConfig {
     /// 2. Global sign key → verify signature
     /// 3. No sign rule → if basic auth is also not configured, allow (open access);
     ///    otherwise deny (caller cannot provide basic auth)
-    pub fn verify_signature(&self, uri_path: &str, sign_param: Option<&str>) -> bool {
+    pub fn verify_signature(&self, uri_path: &str, sign_param: Option<&str>, skip_range_check: bool) -> bool {
         let dav_path = strip_prefix_path(uri_path, &self.prefix);
         let (rule, _has_override) = self.find_sign_rule(dav_path);
 
@@ -91,7 +96,7 @@ impl AuthConfig {
                 let Some(sign_str) = sign_param else {
                     return false;
                 };
-                verifier.verify(uri_path, sign_str, None).is_ok()
+                verifier.verify(uri_path, sign_str, None, skip_range_check).is_ok()
             }
             None => !self.has_basic_auth(),
         }
@@ -202,7 +207,7 @@ async fn auth_inner(config: AuthConfig, req: Request, next: Next) -> Response {
                     .headers()
                     .get(http::header::RANGE)
                     .and_then(|v| v.to_str().ok());
-                match verifier.verify(path, &sign_str, range_header) {
+                match verifier.verify(path, &sign_str, range_header, false) {
                     Ok(()) => return next.run(req).await,
                     Err(e) => {
                         tracing::warn!("Signature verification failed: {e}");

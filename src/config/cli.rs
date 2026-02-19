@@ -2,8 +2,8 @@ use clap::Parser;
 
 /// A WebDAV file server with OwnCloud checksum hash extension support.
 ///
-/// Supports HTTP, HTTPS, and HTTP/3 (QUIC) protocols.
-/// At least one of --http-port, --https-port, or --http3-port must be specified.
+/// Supports HTTP, HTTPS, HTTP/3 (QUIC), and HTTP-over-SSH protocols.
+/// At least one of --http-port, --https-port, --http3-port, or --ssh-port must be specified.
 #[derive(Parser, Debug, Clone)]
 #[command(name = "dfsnode", version, about)]
 pub struct Args {
@@ -22,6 +22,15 @@ pub struct Args {
     /// HTTP/3 port (QUIC over UDP)
     #[arg(long)]
     pub http3_port: Option<u16>,
+
+    /// SSH port (HTTP-over-SSH via direct-tcpip port forwarding)
+    #[arg(long)]
+    pub ssh_port: Option<u16>,
+
+    /// Path to SSH server host key (PEM format, e.g. ed25519 or RSA).
+    /// Required when --ssh-port is specified.
+    #[arg(long)]
+    pub ssh_host_key: Option<String>,
 
     /// Path to TLS certificate file (PEM format).
     /// If omitted when HTTPS/HTTP3 is enabled, a self-signed certificate is
@@ -101,10 +110,27 @@ pub struct Args {
 
 impl Args {
     pub fn validate(&self) -> anyhow::Result<()> {
-        if self.http_port.is_none() && self.https_port.is_none() && self.http3_port.is_none() {
+        if self.http_port.is_none()
+            && self.https_port.is_none()
+            && self.http3_port.is_none()
+            && self.ssh_port.is_none()
+        {
             anyhow::bail!(
-                "At least one of --http-port, --https-port, or --http3-port must be specified"
+                "At least one of --http-port, --https-port, --http3-port, or --ssh-port must be specified"
             );
+        }
+
+        // --ssh-port requires --ssh-host-key
+        if self.ssh_port.is_some() && self.ssh_host_key.is_none() {
+            anyhow::bail!("--ssh-port requires --ssh-host-key to be specified");
+        }
+
+        // Validate SSH host key path is not a directory (file will be auto-generated if missing)
+        if let Some(ref path) = self.ssh_host_key {
+            let p = std::path::Path::new(path);
+            if p.exists() && !p.is_file() {
+                anyhow::bail!("SSH host key path '{}' is not a file", path);
+            }
         }
 
         // cert and key must both be set or both unset

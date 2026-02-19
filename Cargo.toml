@@ -103,6 +103,10 @@ str0m = { version = "0.16.2", default-features = true }
 # Dual-stack socket creation
 socket2 = "0.6"
 
+# SSH server (HTTP-over-SSH) + SFTP
+russh = "0.57"
+russh-sftp = "2.1"
+
 # Error handling
 anyhow = "1"
 

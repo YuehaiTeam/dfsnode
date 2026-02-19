@@ -438,6 +438,23 @@ async fn async_main() -> anyhow::Result<()> {
         }));
     }
 
+    // SSH server (HTTP-over-SSH via direct-tcpip port forwarding)
+    if let Some(port) = args.ssh_port {
+        let host_key = args
+            .ssh_host_key
+            .clone()
+            .expect("validate() ensures ssh_host_key is present when ssh_port is set");
+        let ssh_app = app.clone().layer(server::metrics_layer::MetricsLayer::new("ssh"));
+        let ssh_auth = auth.clone();
+        let ssh_root = root.clone();
+        let ssh_prefix = args.prefix.clone();
+        handles.push(panic_recovery::spawn_catch_panic("ssh-server", async move {
+            if let Err(e) = server::ssh::serve(port, &PathBuf::from(host_key), ssh_app, ssh_auth, ssh_root, ssh_prefix).await {
+                tracing::error!("SSH server error: {e}");
+            }
+        }));
+    }
+
     // HTTPS server
     if let Some(port) = args.https_port {
         let https_app = app.clone().layer(server::metrics_layer::MetricsLayer::new("http"));

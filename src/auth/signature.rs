@@ -28,8 +28,15 @@ impl SignatureVerifier {
         path: &str,
         sign_str: &str,
         range_header: Option<&str>,
+        skip_range_check: bool,
     ) -> Result<(), String> {
-        verify_signature(path, sign_str, &self.sign_token, range_header)
+        verify_signature(
+            path,
+            sign_str,
+            &self.sign_token,
+            range_header,
+            skip_range_check,
+        )
     }
 }
 
@@ -41,6 +48,7 @@ fn verify_signature(
     sign_str: &str,
     sign_token: &str,
     range_header: Option<&str>,
+    skip_range_check: bool,
 ) -> Result<(), String> {
     let sign_bytes = sign_str.as_bytes();
 
@@ -53,8 +61,7 @@ fn verify_signature(
     let uuid = &sign_bytes[0..32];
 
     // Parse expire time from next 8 hex chars (32..40)
-    let expire_time =
-        parse_hex_u32(&sign_bytes[32..40]).ok_or("invalid expire hex")? as u64;
+    let expire_time = parse_hex_u32(&sign_bytes[32..40]).ok_or("invalid expire hex")? as u64;
 
     // Check expiration
     let current_time = SystemTime::now()
@@ -93,8 +100,8 @@ fn verify_signature(
         message.push_str(&format!("{:08x}{:08x}", start, end));
     }
 
-    // Verify Range header matches signature ranges
-    if !ranges.is_empty() {
+    // Verify Range header matches signature ranges (unless skipped for SSH)
+    if !skip_range_check && !ranges.is_empty() {
         let Some(range_header_value) = range_header else {
             return Err("signature has ranges but no Range header provided".into());
         };

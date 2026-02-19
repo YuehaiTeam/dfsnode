@@ -32,7 +32,7 @@ pub async fn handle_webtransport(
     // Strip URL prefix to get DAV-relative path
     // --- Signature verification (uses centralized auth logic) ---
     let sign_param = extract_sign_param(&query);
-    let verified = wt_config.auth.verify_signature(&uri_path, sign_param.as_deref());
+    let verified = wt_config.auth.verify_signature(&uri_path, sign_param.as_deref(), false);
 
     if !verified {
         warn!("WebTransport signature verification failed for: {uri_path}");
