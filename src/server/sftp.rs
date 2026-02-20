@@ -798,7 +798,7 @@ impl Drop for SftpHandler {
     fn drop(&mut self) {
         let ip_str = self
             .peer_addr
-            .map(|a| a.ip().to_string())
+            .map(|a| super::normalize_ip(a.ip()).to_string())
             .unwrap_or_else(|| "-".into());
         let uuid_str = self.uuid.as_deref().unwrap_or("-");
         tracing::info!(

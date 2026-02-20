@@ -18,10 +18,20 @@ pub mod ssl_generate;
 pub mod tls;
 pub mod webtransport;
 
+/// Normalize an IP address: convert IPv6-mapped IPv4 (`::ffff:x.x.x.x`) to
+/// plain IPv4 (`x.x.x.x`).  All other addresses pass through unchanged.
+pub fn normalize_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(ip),
+        other => other,
+    }
+}
+
 /// Real client IP extracted by the real-ip middleware.
 ///
 /// Inserted into request extensions so that downstream layers
 /// (e.g. [`MetricsLayer`]) can read it without re-parsing headers.
+/// The address is always [normalized](normalize_ip) (no `::ffff:` prefix).
 #[derive(Clone, Debug)]
 pub struct RealIp(pub IpAddr);
 
@@ -30,7 +40,7 @@ pub struct RealIp(pub IpAddr);
 /// 1. Reads the [`ClientIpSource`] extension (set by `source.into_extension()`)
 /// 2. Extracts the IP from the corresponding header (X-Real-Ip, X-Forwarded-For, etc.)
 /// 3. Falls back to [`axum::extract::ConnectInfo<SocketAddr>`] (socket address)
-/// 4. Stores the result as [`RealIp`] extension for downstream consumers.
+/// 4. Normalizes and stores the result as [`RealIp`] extension for downstream consumers.
 pub async fn real_ip_middleware(mut req: Request, next: Next) -> Response {
     let header_ip: Option<IpAddr> = req
         .extensions()
@@ -44,7 +54,7 @@ pub async fn real_ip_middleware(mut req: Request, next: Next) -> Response {
     });
 
     if let Some(ip) = ip {
-        req.extensions_mut().insert(RealIp(ip));
+        req.extensions_mut().insert(RealIp(normalize_ip(ip)));
     }
     next.run(req).await
 }

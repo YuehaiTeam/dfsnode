@@ -474,7 +474,7 @@ impl RtcManager {
                 .addr_map
                 .iter()
                 .find(|(_, sid)| **sid == *id)
-                .map(|(addr, _)| addr.ip());
+                .map(|(addr, _)| crate::server::normalize_ip(addr.ip()));
 
             if let Some(session) = self.sessions.remove(id) {
                 let sent = session.bytes_sent();

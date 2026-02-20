@@ -111,7 +111,7 @@ pub async fn handle_webtransport(
 
     let bytes = guard.bytes_sent_so_far();
     let uuid_str = uuid.as_deref().unwrap_or("-");
-    info!("[wt] {} {} {} {}", peer_addr.ip(), uri_path, bytes, uuid_str);
+    info!("[wt] {} {} {} {}", super::normalize_ip(peer_addr.ip()), uri_path, bytes, uuid_str);
 
     // Release the stream, then wait for the client to finish reading
     // before dropping session (which closes the QUIC connection).

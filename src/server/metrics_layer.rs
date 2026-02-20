@@ -124,7 +124,7 @@ where
             .or_else(|| {
                 req.extensions()
                     .get::<axum::extract::ConnectInfo<SocketAddr>>()
-                    .map(|ci| ci.0.ip())
+                    .map(|ci| super::normalize_ip(ci.0.ip()))
             });
 
         let path = req.uri().path().to_owned();
