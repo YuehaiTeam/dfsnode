@@ -1,4 +1,5 @@
 use std::future::Future;
+use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
@@ -6,6 +7,8 @@ use http::{Request, Response};
 use tower::{Layer, Service};
 
 use super::metrics_body::MetricsBody;
+use super::RealIp;
+use crate::auth::{extract_sign_param, extract_uuid_from_sign};
 
 /// Estimate the wire size of an HTTP response status line + headers.
 ///
@@ -113,6 +116,28 @@ where
 
         let skip = should_skip_metrics(&req);
 
+        // Extract request info for access logging before passing request to inner service.
+        let peer_ip: Option<IpAddr> = req
+            .extensions()
+            .get::<RealIp>()
+            .map(|r| r.0)
+            .or_else(|| {
+                req.extensions()
+                    .get::<axum::extract::ConnectInfo<SocketAddr>>()
+                    .map(|ci| ci.0.ip())
+            });
+
+        let path = req.uri().path().to_owned();
+        let uuid = if skip {
+            None
+        } else {
+            req.uri()
+                .query()
+                .and_then(extract_sign_param)
+                .as_deref()
+                .and_then(extract_uuid_from_sign)
+        };
+
         // Clone the service to avoid borrowing issues with poll_ready
         let mut svc = self.inner.clone();
         // Swap so self retains the "ready" service (Tower poll_ready contract)
@@ -126,7 +151,7 @@ where
             let header_bytes = if skip { 0 } else { estimate_response_header_size(&resp) };
 
             let (parts, body) = resp.into_parts();
-            let tracked = MetricsBody::new(body, protocol, skip, header_bytes);
+            let tracked = MetricsBody::new(body, protocol, skip, header_bytes, peer_ip, path, uuid);
             Ok(Response::from_parts(parts, tracked))
         })
     }

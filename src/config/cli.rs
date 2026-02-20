@@ -100,6 +100,13 @@ pub struct Args {
     #[arg(long, default_value_t = false)]
     pub no_tcp_download: bool,
 
+    /// Trust reverse-proxy headers for client IP extraction.
+    /// Accepted values: XRealIp, RightmostXForwardedFor, CfConnectingIp,
+    /// TrueClientIp, FlyClientIp, RightmostForwarded.
+    /// When omitted, the socket peer address is used directly.
+    #[arg(long)]
+    pub real_ip: Option<String>,
+
     /// Auto-generate TLS certificate when the existing one is untrusted
     /// by the system AND has less than 1 day of validity remaining.
     /// Requires --cert and --key to specify output paths.

@@ -7,7 +7,7 @@ use str0m::channel::ChannelId;
 use str0m::net::{Protocol, Receive};
 use str0m::{Event, IceConnectionState, Input, Output, Rtc};
 use tokio::sync::mpsc;
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -225,6 +225,10 @@ pub struct RtcSession {
     bytes_sent: u64,
     /// Sender half of the wake channel used to nudge the RtcManager.
     wake_tx: mpsc::Sender<u64>,
+    /// UUID from the request signature, if present.
+    uuid: Option<String>,
+    /// URI path from the original LOCK request (for access logging).
+    uri_path: String,
 }
 
 impl RtcSession {
@@ -240,6 +244,8 @@ impl RtcSession {
         local_addr: SocketAddr,
         local_candidate_addrs: Vec<SocketAddr>,
         wake_tx: mpsc::Sender<u64>,
+        uuid: Option<String>,
+        uri_path: String,
     ) -> Self {
         let now = Instant::now();
         Self {
@@ -261,6 +267,8 @@ impl RtcSession {
             eof_marker_sent: false,
             bytes_sent: 0,
             wake_tx,
+            uuid,
+            uri_path,
         }
     }
 
@@ -347,7 +355,7 @@ impl RtcSession {
                                 self.last_activity = Instant::now();
                                 self.eof_marker_sent = true;
                                 self.state = SessionState::Draining;
-                                info!(
+                                debug!(
                                     "All file data written to DataChannel ({} bytes) — sent EOF marker, entering Draining",
                                     self.bytes_sent
                                 );
@@ -374,7 +382,7 @@ impl RtcSession {
         if self.state == SessionState::Draining {
             let buffered = self.channel_buffered_amount();
             if !self.rtc.is_alive() && buffered == 0 {
-                info!("Draining complete — str0m connection closed, buffer empty");
+                debug!("Draining complete — str0m connection closed, buffer empty");
                 self.state = SessionState::Done;
             }
         }
@@ -429,7 +437,7 @@ impl RtcSession {
     fn handle_event(&mut self, event: Event) {
         match event {
             Event::Connected => {
-                info!("ICE+DTLS connected");
+                debug!("ICE+DTLS connected");
                 if self.state == SessionState::Pending {
                     self.state = SessionState::Connected;
                     self.last_activity = Instant::now();
@@ -441,13 +449,13 @@ impl RtcSession {
                 if ice_state == IceConnectionState::Disconnected
                     && self.state != SessionState::Draining
                 {
-                    info!("ICE disconnected — marking session as failed");
+                    debug!("ICE disconnected — marking session as failed");
                     self.state = SessionState::Failed;
                 }
             }
 
             Event::ChannelOpen(id, label) => {
-                info!("DataChannel opened: id={id:?}, label={label}");
+                debug!("DataChannel opened: id={id:?}, label={label}");
                 self.channel_id = Some(id);
                 self.state = SessionState::Transferring;
                 self.last_activity = Instant::now();
@@ -472,7 +480,7 @@ impl RtcSession {
             }
 
             Event::ChannelClose(id) => {
-                info!("DataChannel closed: id={id:?}");
+                debug!("DataChannel closed: id={id:?}");
                 if self.channel_id == Some(id) && self.state != SessionState::Draining {
                     // Remote initiated close or echo of our own close.
                     self.state = SessionState::Draining;
@@ -638,6 +646,21 @@ impl RtcSession {
         self.bytes_sent
     }
 
+    /// UUID from the request signature, if present.
+    pub fn uuid(&self) -> &Option<String> {
+        &self.uuid
+    }
+
+    /// Path to the file being transferred.
+    pub fn file_path(&self) -> &std::path::Path {
+        &self.file_path
+    }
+
+    /// URI path from the original LOCK request.
+    pub fn uri_path(&self) -> &str {
+        &self.uri_path
+    }
+
     // ------------------------------------------------------------------
     // Internal helpers
     // ------------------------------------------------------------------
@@ -684,7 +707,7 @@ impl RtcSession {
         {
             let buffered = self.channel_buffered_amount();
             if buffered == 0 {
-                info!(
+                debug!(
                     "Draining timeout ({DRAINING_TIMEOUT_SECS}s) — session complete (buffer empty)"
                 );
                 self.state = SessionState::Done;

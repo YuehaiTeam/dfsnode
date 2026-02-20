@@ -26,6 +26,10 @@ pub struct CreateSessionCmd {
     pub file_size: u64,
     pub sdp_offer: String,
     pub remote_candidates: Vec<handler::IceCandidate>,
+    /// UUID from the request signature, if present.
+    pub uuid: Option<String>,
+    /// URI path from the LOCK request (for access logging).
+    pub uri_path: String,
     pub reply: oneshot::Sender<Result<(u64, String, Vec<handler::IceCandidate>), anyhow::Error>>,
 }
 
@@ -54,6 +58,8 @@ impl RtcHandle {
         file_path: PathBuf,
         sdp_offer: String,
         remote_candidates: Vec<handler::IceCandidate>,
+        uuid: Option<String>,
+        uri_path: String,
     ) -> Result<(u64, String, Vec<handler::IceCandidate>), anyhow::Error> {
         // Collect file size asynchronously before entering the sync manager path.
         // If this fails, bail out early rather than sending incorrect size=0.
@@ -72,6 +78,8 @@ impl RtcHandle {
                 file_size,
                 sdp_offer,
                 remote_candidates,
+                uuid,
+                uri_path,
                 reply: reply_tx,
             })
             .await
@@ -184,6 +192,8 @@ impl RtcManager {
         file_size: u64,
         sdp_offer: &str,
         remote_candidates: Vec<handler::IceCandidate>,
+        uri_path: String,
+        uuid: Option<String>,
     ) -> Result<(u64, String, Vec<handler::IceCandidate>), anyhow::Error> {
         let mut rtc = Rtc::new(Instant::now());
 
@@ -306,10 +316,10 @@ impl RtcManager {
             })
             .collect();
 
-        let session = RtcSession::new(rtc, session_id, file_path, file_size, local_addr, candidate_addrs, self.wake_tx.clone());
+        let session = RtcSession::new(rtc, session_id, file_path, file_size, local_addr, candidate_addrs, self.wake_tx.clone(), uuid, uri_path);
         self.sessions.insert(session_id, session);
 
-        info!("Created RTC session {session_id}");
+        debug!("Created RTC session {session_id}");
 
         Ok((session_id, sdp_answer_string, local_candidates))
     }
@@ -350,6 +360,8 @@ impl RtcManager {
                                 cmd.file_size,
                                 &cmd.sdp_offer,
                                 cmd.remote_candidates,
+                                cmd.uri_path,
+                                cmd.uuid,
                             );
                             let _ = cmd.reply.send(result);
                         }
@@ -457,14 +469,26 @@ impl RtcManager {
             .collect();
 
         for id in &dead_ids {
+            // Look up peer IP from addr_map before session is removed.
+            let peer_ip = self
+                .addr_map
+                .iter()
+                .find(|(_, sid)| **sid == *id)
+                .map(|(addr, _)| addr.ip());
+
             if let Some(session) = self.sessions.remove(id) {
                 let sent = session.bytes_sent();
                 let mut guard = crate::metrics::MetricsGuard::new("rtc");
                 guard.set_bytes(sent);
                 // guard Drop will record request + bytes_sent
+                let ip_str = peer_ip
+                    .map(|ip| ip.to_string())
+                    .unwrap_or_else(|| "-".into());
+                let uuid_str = session.uuid().as_deref().unwrap_or("-");
+                let uri_path = session.uri_path();
                 info!(
-                    "Removed RTC session {id} (state={:?}, bytes_sent={sent})",
-                    session.state()
+                    "[rtc] {} {} {} {}",
+                    ip_str, uri_path, sent, uuid_str,
                 );
             }
         }

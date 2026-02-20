@@ -13,6 +13,7 @@ futures-util = "0.3"
 
 # HTTP server
 axum = "0.8"
+axum-client-ip = { version = "1", features = ["connect-info", "forwarded-header"] }
 hyper = { version = "1", features = ["http1", "http2", "server"] }
 hyper-util = { version = "0.1", features = [
     "tokio",

@@ -107,8 +107,9 @@ pub(crate) enum AuthMode {
     /// Authenticated via WebDAV basic credentials — full read-only access.
     WebDav,
     /// Authenticated via path/signature — single file read-only access.
-    /// Contains the normalized path (with prefix, e.g., "/dav/foo.txt").
-    Signature { path: String },
+    /// Contains the normalized path (with prefix, e.g., "/dav/foo.txt")
+    /// and the UUID from the signature (first 32 hex chars), if present.
+    Signature { path: String, uuid: Option<String> },
 }
 
 /// Per-connection SSH handler.
@@ -170,25 +171,25 @@ impl russh::server::Handler for SshHandler {
             .is_some_and(|(u, p)| u == user && p == password);
 
         // Mode 2: Signature — normalized username is a file path, password is the sign value
-        let sign_ok = if !basic_ok {
+        let (sign_ok, sign_uuid) = if !basic_ok {
             tracing::debug!("SSH auth attempt with signature credentials: user='{user}' (normalized path: '{path}')");
             self.auth.verify_signature(&path, Some(password), true)
         } else {
-            false
+            (false, None)
         };
 
         // Record which auth mode succeeded for SFTP access control
         if no_auth || basic_ok {
             self.auth_mode = AuthMode::WebDav;
         } else if sign_ok {
-            self.auth_mode = AuthMode::Signature { path: path.clone() };
+            self.auth_mode = AuthMode::Signature { path: path.clone(), uuid: sign_uuid };
         }
 
         let peer = self.peer_addr;
 
         async move {
             if no_auth || basic_ok || sign_ok {
-                info!("SSH auth accepted for '{user}' from {peer:?}");
+                debug!("SSH auth accepted for '{user}' from {peer:?}");
                 Ok(Auth::Accept)
             } else {
                 debug!("SSH auth rejected for '{user}' from {peer:?}");
@@ -232,7 +233,7 @@ impl russh::server::Handler for SshHandler {
                     AuthMode::None | AuthMode::WebDav => {
                         SftpAccess::full(self.root.clone(), self.prefix.clone())
                     }
-                    AuthMode::Signature { path } => {
+                    AuthMode::Signature { path, .. } => {
                         SftpAccess::single_file(
                             self.root.clone(),
                             self.prefix.clone(),
@@ -241,9 +242,13 @@ impl russh::server::Handler for SshHandler {
                     }
                 };
                 let peer = self.peer_addr;
-                info!("SFTP subsystem started for {peer:?} (mode: {:?})", self.auth_mode);
+                let uuid = match &self.auth_mode {
+                    AuthMode::Signature { uuid, .. } => uuid.clone(),
+                    _ => None,
+                };
+                debug!("SFTP subsystem started for {peer:?} (mode: {:?})", self.auth_mode);
                 crate::panic_recovery::spawn_catch_panic("sftp-session", async move {
-                    let handler = SftpHandler::new(access);
+                    let handler = SftpHandler::new(access, peer, uuid);
                     russh_sftp::server::run(channel.into_stream(), handler).await;
                     debug!("SFTP session ended for {peer:?}");
                 });
@@ -288,7 +293,7 @@ impl russh::server::Handler for SshHandler {
         let host = host_to_connect.to_string();
 
         async move {
-            info!(
+            debug!(
                 "SSH direct-tcpip from {peer_addr:?} \
                  (originator {originator_address}:{originator_port}) \
                  -> {host}:{port_to_connect} (virtual HTTP bridge)"
@@ -302,9 +307,14 @@ impl russh::server::Handler for SshHandler {
                 let io = hyper_util::rt::TokioIo::new(stream);
                 let service =
                     hyper::service::service_fn(
-                        move |req: hyper::Request<hyper::body::Incoming>| {
+                        move |mut req: hyper::Request<hyper::body::Incoming>| {
                             let mut app = app.clone();
+                            let addr = peer_addr;
                             async move {
+                                if let Some(addr) = addr {
+                                    req.extensions_mut()
+                                        .insert(axum::extract::ConnectInfo(addr));
+                                }
                                 let resp =
                                     app.call(req).await.unwrap_or_else(|err| match err {});
                                 Ok::<_, std::convert::Infallible>(resp)

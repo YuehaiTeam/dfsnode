@@ -4,7 +4,7 @@ use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use tracing::{info, warn};
+use tracing::{debug, warn};
 
 // ---------------------------------------------------------------------------
 // Data structures
@@ -62,12 +62,14 @@ pub struct LockResponse {
 /// wraps the entire router.
 ///
 /// `path` is the raw request URI path (prefix already stripped by the caller).
+/// `uuid` is extracted from the request's `$` query parameter, if present.
 pub async fn lock_handler(
     State(rtc_state): State<RtcState>,
     path: String,
     Json(lock_req): Json<LockRequest>,
+    uuid: Option<String>,
 ) -> Response {
-    info!("LOCK handler hit: /{path}");
+    debug!("LOCK handler hit: /{path}");
 
     if lock_req.sdp.is_empty() {
         warn!("LOCK: missing SDP");
@@ -89,13 +91,14 @@ pub async fn lock_handler(
     }
 
     // Create a WebRTC session.
+    let uri_path = format!("/{path}");
     match rtc_state
         .rtc_handle
-        .create_session(file_path, lock_req.sdp, lock_req.candidates)
+        .create_session(file_path, lock_req.sdp, lock_req.candidates, uuid, uri_path)
         .await
     {
         Ok((_session_id, sdp_answer, local_candidates)) => {
-            info!("LOCK: created RTC session for /{rel}");
+            debug!("LOCK: created RTC session for /{rel}");
             let resp = LockResponse {
                 sdp: sdp_answer,
                 candidates: local_candidates,

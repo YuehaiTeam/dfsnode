@@ -11,6 +11,9 @@ use crate::auth::signature::SignatureVerifier;
 use crate::config::cli::Args;
 use crate::config::{FileConfig, SignatureSetting};
 
+/// WebDAV methods that mutate state.
+const WRITE_METHODS: &[&str] = &["PUT", "DELETE", "MKCOL", "MOVE", "COPY", "PROPPATCH", "PATCH", "POST"];
+
 /// Credentials for basic auth.
 #[derive(Clone)]
 pub(crate) struct BasicCredentials {
@@ -86,19 +89,27 @@ impl AuthConfig {
     /// 2. Global sign key → verify signature
     /// 3. No sign rule → if basic auth is also not configured, allow (open access);
     ///    otherwise deny (caller cannot provide basic auth)
-    pub fn verify_signature(&self, uri_path: &str, sign_param: Option<&str>, skip_range_check: bool) -> bool {
+    ///
+    /// When `sign_param` is provided and verification succeeds, returns the
+    /// UUID embedded in the signature (first 32 hex chars).
+    pub fn verify_signature(&self, uri_path: &str, sign_param: Option<&str>, skip_range_check: bool) -> (bool, Option<String>) {
         let dav_path = strip_prefix_path(uri_path, &self.prefix);
         let (rule, _has_override) = self.find_sign_rule(dav_path);
 
         match rule {
-            Some(SignRule::Open) => true,
+            Some(SignRule::Open) => (true, None),
             Some(SignRule::Key(verifier)) => {
                 let Some(sign_str) = sign_param else {
-                    return false;
+                    return (false, None);
                 };
-                verifier.verify(uri_path, sign_str, None, skip_range_check).is_ok()
+                let uuid = extract_uuid_from_sign(sign_str);
+                if verifier.verify(uri_path, sign_str, None, skip_range_check).is_ok() {
+                    (true, uuid)
+                } else {
+                    (false, None)
+                }
             }
-            None => !self.has_basic_auth(),
+            None => (!self.has_basic_auth(), None),
         }
     }
 
@@ -172,7 +183,26 @@ async fn auth_inner(config: AuthConfig, req: Request, next: Next) -> Response {
         return next.run(req).await;
     }
 
-    if req.method() == http::Method::GET || req.method() == http::Method::from_bytes(b"PROPFIND").unwrap() {
+    // Read-only enforcement: when no WebDAV password is configured, reject
+    // all state-mutating methods with 403 Forbidden.
+    // Exclude internal paths and LOCK (WebRTC signaling).
+    if !config.has_basic_auth() {
+        let method_str = req.method().as_str();
+        let path = req.uri().path();
+        if WRITE_METHODS.iter().any(|m| m.eq_ignore_ascii_case(method_str))
+            && !path.starts_with("/-/")
+            && !path.starts_with("/minio/")
+            && method_str != "LOCK"
+        {
+            return (StatusCode::FORBIDDEN, "Forbidden: server is read-only (no WebDAV password configured)")
+                .into_response();
+        }
+    }
+
+    if req.method() == http::Method::GET
+        || req.method() == http::Method::from_bytes(b"PROPFIND").unwrap()
+        || req.method().as_str() == "LOCK"
+    {
         let uri_path = req.uri().path();
 
         // Compute the DAV-relative path by stripping the prefix
@@ -278,6 +308,18 @@ pub fn extract_sign_param(query: &str) -> Option<String> {
             }
     }
     None
+}
+
+/// Extract the UUID (first 32 hex characters) from a signature string.
+///
+/// Signature format: `{32B uuid hex}{8B expire hex}{64B hmac hex}{ranges…}`
+pub fn extract_uuid_from_sign(sign: &str) -> Option<String> {
+    let prefix = sign.get(..32)?;
+    if prefix.chars().all(|c| c.is_ascii_hexdigit()) {
+        Some(prefix.to_string())
+    } else {
+        None
+    }
 }
 
 /// Build AuthConfig from CLI args (legacy mode, no config file).

@@ -10,6 +10,7 @@
 //! Symlinks are not supported.
 
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use russh_sftp::protocol::{
@@ -99,14 +100,26 @@ pub(crate) struct SftpHandler {
     access: SftpAccess,
     handles: HashMap<String, OpenHandle>,
     next_handle: u64,
+    /// Track total bytes read across all file handles for access logging.
+    bytes_sent: u64,
+    /// Client IP for access logging.
+    peer_addr: Option<SocketAddr>,
+    /// UUID from signature auth, if present.
+    uuid: Option<String>,
+    /// Last opened file path (SFTP path as seen by the client).
+    path: String,
 }
 
 impl SftpHandler {
-    pub fn new(access: SftpAccess) -> Self {
+    pub fn new(access: SftpAccess, peer_addr: Option<SocketAddr>, uuid: Option<String>) -> Self {
         Self {
             access,
             handles: HashMap::new(),
             next_handle: 0,
+            bytes_sent: 0,
+            peer_addr,
+            uuid,
+            path: "-".into(),
         }
     }
 
@@ -350,6 +363,8 @@ impl russh_sftp::server::Handler for SftpHandler {
                     std::fs::File::open(&physical).map_err(|_| StatusCode::PermissionDenied)?;
                 let handle = self.alloc_handle();
                 self.handles.insert(handle.clone(), OpenHandle::File(file));
+                // Track the last opened file path for access logging
+                self.path = filename;
                 Ok(Handle { id, handle })
             })()
         };
@@ -399,6 +414,7 @@ impl russh_sftp::server::Handler for SftpHandler {
                 return Err(StatusCode::Eof);
             }
             buf.truncate(n);
+            self.bytes_sent += n as u64;
             Ok(Data { id, data: buf })
         })();
         std::future::ready(result)
@@ -771,6 +787,29 @@ impl SftpHandler {
         }
 
         Ok(entries)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Drop implementation
+// ---------------------------------------------------------------------------
+
+impl Drop for SftpHandler {
+    fn drop(&mut self) {
+        let ip_str = self
+            .peer_addr
+            .map(|a| a.ip().to_string())
+            .unwrap_or_else(|| "-".into());
+        let uuid_str = self.uuid.as_deref().unwrap_or("-");
+        tracing::info!(
+            "[sftp] {} {} {} {}",
+            ip_str,
+            self.path,
+            self.bytes_sent,
+            uuid_str,
+        );
+        crate::metrics::record_request("sftp");
+        crate::metrics::record_bytes_sent("sftp", self.bytes_sent);
     }
 }
 

@@ -119,6 +119,7 @@ async fn handle_connection(
     wt_config: WtConfig,
 ) -> anyhow::Result<()> {
     let connection = incoming.await?;
+    let peer_addr = connection.remote_address();
 
     // Use builder to enable WebTransport + Extended CONNECT (no datagram)
     let mut h3_conn = h3::server::builder()
@@ -141,7 +142,7 @@ async fn handle_connection(
 
             // Handle WebTransport — this moves h3_conn, so we return after
             if let Err(e) =
-                super::webtransport::handle_webtransport(req, stream, h3_conn, &wt_config).await
+                super::webtransport::handle_webtransport(req, stream, h3_conn, &wt_config, peer_addr).await
             {
                 tracing::warn!("WebTransport session error: {e}");
             }
@@ -150,8 +151,9 @@ async fn handle_connection(
 
         // Normal H3 request — dispatch through axum
         let app = app.clone();
+        let addr = peer_addr;
         crate::panic_recovery::spawn_catch_panic("h3-request", async move {
-            if let Err(e) = handle_request(req, stream, app).await {
+            if let Err(e) = handle_request(req, stream, app, addr).await {
                 debug!("HTTP/3 request error: {e}");
             }
         });
@@ -170,13 +172,29 @@ async fn handle_request(
     req: http::Request<()>,
     mut stream: h3::server::RequestStream<h3_quinn::BidiStream<bytes::Bytes>, bytes::Bytes>,
     mut app: Router,
+    peer_addr: SocketAddr,
 ) -> anyhow::Result<()> {
-    // Read the full request body from the QUIC stream
-    let (parts, _) = req.into_parts();
+    // Read the full request body from the QUIC stream (capped to prevent memory DoS).
+    const MAX_H3_BODY_SIZE: usize = 2 * 1024 * 1024; // 2 MiB — sufficient for WebDAV XML / LOCK JSON
+    let (mut parts, _) = req.into_parts();
     let mut body_data = Vec::new();
     while let Some(chunk) = stream.recv_data().await? {
         body_data.extend_from_slice(chunk.chunk());
+        if body_data.len() > MAX_H3_BODY_SIZE {
+            let resp = http::Response::builder()
+                .status(http::StatusCode::PAYLOAD_TOO_LARGE)
+                .body(())
+                .unwrap();
+            stream.send_response(resp).await?;
+            stream.finish().await?;
+            return Ok(());
+        }
     }
+
+    // Inject peer address so MetricsLayer can extract it
+    parts
+        .extensions
+        .insert(axum::extract::ConnectInfo(peer_addr));
 
     // Build an axum-compatible request with a real Body
     let body = axum::body::Body::from(bytes::Bytes::from(body_data));

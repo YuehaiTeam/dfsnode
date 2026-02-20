@@ -13,6 +13,9 @@ pub struct FileConfig {
     pub username: Option<String>,
     pub password: Option<String>,
     pub sign_key: Option<String>,
+    /// Trust reverse-proxy headers for client IP extraction.
+    /// Accepted values: XRealIp, RightmostXForwardedFor, CfConnectingIp, etc.
+    pub real_ip: Option<String>,
     pub paths: Option<HashMap<String, PathAuthConfig>>,
     pub tus: Option<TusFileConfig>,
     pub stun: Option<StunFileConfig>,

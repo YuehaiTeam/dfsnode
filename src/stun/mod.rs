@@ -222,7 +222,7 @@ impl StunDemuxSocket {
                 }
 
                 if current.insert(public_addr) {
-                    info!("STUN discovered public address: {public_addr}");
+                    debug!("STUN discovered public address: {public_addr}");
                     true
                 } else {
                     trace!("STUN public address already known: {public_addr}");

@@ -14,12 +14,13 @@ use std::time::Duration;
 
 use axum::Router;
 use axum::middleware;
+use axum_client_ip::ClientIpSource;
 use clap::Parser;
 use dav_server::DavHandler;
 use dav_server::localfs::LocalFs;
-use tracing::info;
+use tracing::{debug, info};
 
-use crate::auth::{AuthConfig, auth_middleware, build_auth_from_args, build_auth_from_config};
+use crate::auth::{AuthConfig, auth_middleware, build_auth_from_args, build_auth_from_config, extract_sign_param, extract_uuid_from_sign};
 use crate::config::cli::Args;
 use crate::config::{FileConfig, load_config};
 use crate::dav::ChecksumAwareFileSystem;
@@ -172,6 +173,14 @@ async fn handle_lock(
         uri_path
     };
 
+    // Extract UUID from the $ signature query param
+    let uuid = req
+        .uri()
+        .query()
+        .and_then(extract_sign_param)
+        .as_deref()
+        .and_then(extract_uuid_from_sign);
+
     // Parse JSON body
     let body_bytes = match axum::body::to_bytes(req.into_body(), 64 * 1024).await {
         Ok(b) => b,
@@ -200,6 +209,7 @@ async fn handle_lock(
         axum::extract::State(rtc_state),
         rel_path,
         axum::Json(lock_req),
+        uuid,
     )
     .await
 }
@@ -342,6 +352,35 @@ async fn async_main() -> anyhow::Result<()> {
 
     let app = build_router(&root, &args.prefix, auth.clone(), tus_manager, rtc_state_for_router);
 
+    // Resolve the ClientIpSource for real-ip support.
+    // CLI --real-ip takes priority over config file real_ip field.
+    let real_ip_source: ClientIpSource = {
+        let raw = args
+            .real_ip
+            .as_deref()
+            .or(file_config.as_ref().and_then(|fc| fc.real_ip.as_deref()));
+        match raw {
+            Some(s) => s.parse::<ClientIpSource>().unwrap_or_else(|_| {
+                tracing::warn!(
+                    "Unknown --real-ip value '{s}', falling back to ConnectInfo"
+                );
+                ClientIpSource::ConnectInfo
+            }),
+            None => ClientIpSource::ConnectInfo,
+        }
+    };
+    if !matches!(real_ip_source, ClientIpSource::ConnectInfo) {
+        info!("Real-IP enabled: source = {real_ip_source:?}");
+    }
+
+    /// Build a protocol-specific app by applying: MetricsLayer → real-ip middleware → source extension.
+    /// Execution order: source extension (outermost) → real-ip → MetricsLayer (innermost of these three).
+    fn build_protocol_app(app: Router, protocol: &'static str, source: ClientIpSource) -> Router {
+        app.layer(server::metrics_layer::MetricsLayer::new(protocol))
+            .layer(axum::middleware::from_fn(server::real_ip_middleware))
+            .layer(source.into_extension())
+    }
+
     // Determine TLS source: file-based or self-signed
     let needs_tls = args.https_port.is_some() || args.http3_port.is_some();
     let tls_source: Option<TlsSource> = if needs_tls {
@@ -398,7 +437,7 @@ async fn async_main() -> anyhow::Result<()> {
                             tracing::warn!("STUN server '{server_str}' resolved to no addresses");
                         } else {
                             for addr in &resolved {
-                                info!("STUN server '{server_str}' resolved to {addr}");
+                                debug!("STUN server '{server_str}' resolved to {addr}");
                             }
                             all_addrs.extend(resolved);
                         }
@@ -430,7 +469,7 @@ async fn async_main() -> anyhow::Result<()> {
 
     // HTTP server
     if let Some(port) = args.http_port {
-        let http_app = app.clone().layer(server::metrics_layer::MetricsLayer::new("http"));
+        let http_app = build_protocol_app(app.clone(), "http", real_ip_source.clone());
         handles.push(panic_recovery::spawn_catch_panic("http-server", async move {
             if let Err(e) = server::http::serve(port, http_app).await {
                 tracing::error!("HTTP server error: {e}");
@@ -444,7 +483,7 @@ async fn async_main() -> anyhow::Result<()> {
             .ssh_host_key
             .clone()
             .expect("validate() ensures ssh_host_key is present when ssh_port is set");
-        let ssh_app = app.clone().layer(server::metrics_layer::MetricsLayer::new("ssh"));
+        let ssh_app = build_protocol_app(app.clone(), "ssh", real_ip_source.clone());
         let ssh_auth = auth.clone();
         let ssh_root = root.clone();
         let ssh_prefix = args.prefix.clone();
@@ -457,7 +496,7 @@ async fn async_main() -> anyhow::Result<()> {
 
     // HTTPS server
     if let Some(port) = args.https_port {
-        let https_app = app.clone().layer(server::metrics_layer::MetricsLayer::new("http"));
+        let https_app = build_protocol_app(app.clone(), "http", real_ip_source.clone());
         let https_config = match tls_source.as_ref().unwrap() {
             TlsSource::File { cert, key } => server::tls::build_https_config(cert, key)?,
             TlsSource::SelfSigned(resolver) => {
@@ -473,7 +512,7 @@ async fn async_main() -> anyhow::Result<()> {
 
     // HTTP/3 server (with optional STUN NAT traversal + WebTransport)
     if let Some(port) = args.http3_port {
-        let h3_app = app.clone().layer(server::metrics_layer::MetricsLayer::new("h3"));
+        let h3_app = build_protocol_app(app.clone(), "h3", real_ip_source);
         let quic_config = match tls_source.as_ref().unwrap() {
             TlsSource::File { cert, key } => server::tls::build_quic_config(cert, key)?,
             TlsSource::SelfSigned(resolver) => {

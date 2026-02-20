@@ -8,20 +8,20 @@ lazy_static! {
     /// Total number of requests by protocol.
     /// Labels: protocol (http, h3, wt, rtc)
     pub static ref DFS_REQUESTS_TOTAL: IntCounterVec = register_int_counter_vec!(
-        "dfs_requests_total",
+        "dfsnode_requests_total",
         "Total number of requests by protocol",
         &["protocol"]
     )
-    .expect("failed to register dfs_requests_total");
+    .expect("failed to register dfsnode_requests_total");
 
     /// Total bytes sent by protocol.
     /// Labels: protocol (http, h3, wt, rtc)
     pub static ref DFS_BYTES_SENT_TOTAL: IntCounterVec = register_int_counter_vec!(
-        "dfs_bytes_sent_total",
+        "dfsnode_bytes_sent_total",
         "Total bytes sent by protocol",
         &["protocol"]
     )
-    .expect("failed to register dfs_bytes_sent_total");
+    .expect("failed to register dfsnode_bytes_sent_total");
 }
 
 /// Gather and encode metrics in Prometheus text format.

@@ -34,9 +34,12 @@ pub async fn serve(
             };
 
             let io = hyper_util::rt::TokioIo::new(tls_stream);
-            let service = hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
+            let service = hyper::service::service_fn(move |mut req: hyper::Request<hyper::body::Incoming>| {
                 let mut app = app.clone();
+                let addr = peer_addr;
                 async move {
+                    req.extensions_mut()
+                        .insert(axum::extract::ConnectInfo(addr));
                     let resp = app.call(req).await.unwrap_or_else(|err| match err {});
                     Ok::<_, std::convert::Infallible>(resp)
                 }

@@ -1,7 +1,8 @@
+use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::auth::{AuthConfig, extract_sign_param};
 use crate::metrics::MetricsGuard;
@@ -23,16 +24,16 @@ pub async fn handle_webtransport(
     stream: h3::server::RequestStream<h3_quinn::BidiStream<bytes::Bytes>, bytes::Bytes>,
     h3_conn: h3::server::Connection<h3_quinn::Connection, bytes::Bytes>,
     wt_config: &WtConfig,
+    peer_addr: SocketAddr,
 ) -> anyhow::Result<()> {
     let mut guard = MetricsGuard::new("wt");
 
     let uri_path = req.uri().path().to_owned();
     let query = req.uri().query().unwrap_or("").to_owned();
 
-    // Strip URL prefix to get DAV-relative path
     // --- Signature verification (uses centralized auth logic) ---
     let sign_param = extract_sign_param(&query);
-    let verified = wt_config.auth.verify_signature(&uri_path, sign_param.as_deref(), false);
+    let (verified, uuid) = wt_config.auth.verify_signature(&uri_path, sign_param.as_deref(), false);
 
     if !verified {
         warn!("WebTransport signature verification failed for: {uri_path}");
@@ -51,30 +52,43 @@ pub async fn handle_webtransport(
     let session =
         h3_webtransport::server::WebTransportSession::accept(req, stream, h3_conn).await?;
     let session_id = session.session_id();
-    info!("WebTransport session established (id={session_id:?}) for: {uri_path}");
+    debug!("WebTransport session established (id={session_id:?}) for: {uri_path}");
 
-    // Resolve file path
-    let file_path = wt_config.root.join(
-        uri_path
-            .strip_prefix('/')
-            .unwrap_or(&uri_path),
-    );
+    // --- Resolve file path (strip URL prefix, prevent directory traversal) ---
+    let prefix = wt_config.prefix.trim_end_matches('/');
+    let stripped = if !prefix.is_empty() && prefix != "/" {
+        uri_path.strip_prefix(prefix).unwrap_or(&uri_path)
+    } else {
+        &uri_path
+    };
+    let rel = stripped.strip_prefix('/').unwrap_or(stripped);
+    let file_path = wt_config.root.join(rel);
 
-    if !file_path.exists() || !file_path.is_file() {
-        warn!("WebTransport: file not found: {}", file_path.display());
-        // Session is already accepted, just drop it to close
-        drop(session);
-        return Ok(());
-    }
+    // Canonicalize both root and target to prevent ../ traversal
+    let canonical_root = wt_config
+        .root
+        .canonicalize()
+        .unwrap_or_else(|_| wt_config.root.clone());
+    let canonical_file = match file_path.canonicalize() {
+        Ok(p) if p.starts_with(&canonical_root) && p.is_file() => p,
+        _ => {
+            warn!(
+                "WebTransport: file not accessible or outside root: {}",
+                file_path.display()
+            );
+            drop(session);
+            return Ok(());
+        }
+    };
 
     // --- Open server→client unidirectional stream and push file ---
     let mut uni_stream = session.open_uni(session_id).await?;
-    info!(
+    debug!(
         "WebTransport: pushing file {} via uni stream",
-        file_path.display()
+        canonical_file.display()
     );
 
-    let mut file = tokio::fs::File::open(&file_path).await?;
+    let mut file = tokio::fs::File::open(&canonical_file).await?;
     let file_size = file.metadata().await?.len();
 
     // Send 8-byte big-endian file size header before file data
@@ -94,7 +108,10 @@ pub async fn handle_webtransport(
 
     // Shutdown the stream to signal completion (sends QUIC FIN)
     uni_stream.shutdown().await?;
-    info!("WebTransport: file sent ({} bytes), closing session", guard.bytes_sent_so_far());
+
+    let bytes = guard.bytes_sent_so_far();
+    let uuid_str = uuid.as_deref().unwrap_or("-");
+    info!("[wt] {} {} {} {}", peer_addr.ip(), uri_path, bytes, uuid_str);
 
     // Release the stream, then wait for the client to finish reading
     // before dropping session (which closes the QUIC connection).
