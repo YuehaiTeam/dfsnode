@@ -106,6 +106,17 @@ pub struct Args {
     /// If the cert file does not exist, a new self-signed certificate is created.
     #[arg(long, default_value_t = false)]
     pub ssl_generate: bool,
+
+    /// URL to push metrics to (e.g. "http://user:pass@victoriametrics:8428/api/v1/import/prometheus").
+    /// Supports basic auth embedded in URL. Can be specified multiple times.
+    /// If also set in config file, all URLs receive pushes.
+    #[arg(long, action = clap::ArgAction::Append)]
+    pub metrics_push_url: Vec<String>,
+
+    /// Interval in seconds between metrics pushes (default: 15).
+    /// If also set in config file, the smaller value is used.
+    #[arg(long)]
+    pub metrics_push_interval_secs: Option<u64>,
 }
 
 impl Args {

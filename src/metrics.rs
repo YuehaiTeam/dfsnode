@@ -2,6 +2,7 @@ use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
 use lazy_static::lazy_static;
 use prometheus::{register_int_counter_vec, Encoder, IntCounterVec, TextEncoder};
 use serde::Deserialize;
+use std::time::Duration;
 
 lazy_static! {
     /// Total number of requests by protocol.
@@ -179,4 +180,129 @@ impl Drop for MetricsGuard {
             record_bytes_sent(self.protocol, self.bytes_sent);
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Metrics Push (remote-write to VictoriaMetrics / Prometheus)
+// ---------------------------------------------------------------------------
+
+/// A parsed push target with optional basic auth credentials.
+struct PushTarget {
+    /// URL without credentials (credentials stripped after parsing).
+    url: String,
+    /// Optional (username, password) extracted from the original URL.
+    auth: Option<(String, String)>,
+}
+
+/// Parse a raw URL string, extract basic-auth credentials, and return a
+/// [`PushTarget`] with a clean (credential-free) URL.
+fn parse_push_url(raw: &str) -> Result<PushTarget, url::ParseError> {
+    let parsed = url::Url::parse(raw)?;
+
+    let auth = if !parsed.username().is_empty() {
+        Some((
+            parsed.username().to_string(),
+            parsed.password().unwrap_or("").to_string(),
+        ))
+    } else {
+        None
+    };
+
+    // Rebuild URL without embedded credentials
+    let mut clean = parsed.clone();
+    let _ = clean.set_username("");
+    let _ = clean.set_password(None);
+
+    Ok(PushTarget {
+        url: clean.to_string(),
+        auth,
+    })
+}
+
+/// Spawn a background task that periodically pushes metrics to one or more
+/// remote endpoints (e.g. VictoriaMetrics `/api/v1/import/prometheus`).
+///
+/// Each push sends **both** the standard Prometheus text format and the
+/// MinIO-compatible format concatenated into a single body.
+///
+/// * `urls`     – raw push URLs (may contain basic-auth credentials).
+/// * `interval` – time between consecutive pushes.
+pub fn spawn_metrics_push(urls: Vec<String>, interval: Duration) {
+    let targets: Vec<PushTarget> = urls
+        .iter()
+        .filter_map(|raw| match parse_push_url(raw) {
+            Ok(t) => {
+                tracing::info!(
+                    "Metrics push target: {} (auth={})",
+                    t.url,
+                    t.auth.is_some()
+                );
+                Some(t)
+            }
+            Err(e) => {
+                tracing::warn!("Invalid metrics push URL '{}': {}", raw, e);
+                None
+            }
+        })
+        .collect();
+
+    if targets.is_empty() {
+        return;
+    }
+
+    // One shared client for all targets.
+    let client = match reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!("Failed to build metrics push HTTP client: {}", e);
+            return;
+        }
+    };
+
+    crate::panic_recovery::spawn_catch_panic("metrics-push", async move {
+        let mut ticker = tokio::time::interval(interval);
+        // The first tick fires immediately — skip it so we don't push at
+        // startup before any real data has been collected.
+        ticker.tick().await;
+
+        loop {
+            ticker.tick().await;
+
+            // Gather both formats and concatenate.
+            let standard = gather_metrics();
+            let minio = gather_minio_compat_metrics();
+            let mut body = standard;
+            body.extend_from_slice(minio.as_bytes());
+
+            for target in &targets {
+                let mut req = client
+                    .post(&target.url)
+                    .header("Content-Type", "text/plain; charset=utf-8")
+                    .body(body.clone());
+
+                if let Some((ref user, ref pass)) = target.auth {
+                    req = req.basic_auth(user, Some(pass));
+                }
+
+                match req.send().await {
+                    Ok(resp) if resp.status().is_success() => {
+                        tracing::debug!("Metrics pushed to {}", target.url);
+                    }
+                    Ok(resp) => {
+                        tracing::warn!(
+                            "Metrics push to {} returned {}",
+                            target.url,
+                            resp.status()
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!("Metrics push to {} failed: {}", target.url, e);
+                    }
+                }
+            }
+        }
+    });
 }

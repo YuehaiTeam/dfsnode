@@ -19,6 +19,8 @@ pub struct FileConfig {
     /// Webhook URL to call when STUN-discovered public address changes.
     /// Supports basic auth in URL: "https://user:pass@host/path"
     pub webhook_url: Option<String>,
+    /// Metrics push configuration for remote-write to VictoriaMetrics / Prometheus.
+    pub metrics_push: Option<MetricsPushFileConfig>,
 }
 
 /// Per-path authentication override.
@@ -64,6 +66,30 @@ impl StunFileConfig {
             servers.clone()
         } else if let Some(ref server) = self.server {
             vec![server.clone()]
+        } else {
+            vec![]
+        }
+    }
+}
+
+/// Metrics push configuration for remote-write to VictoriaMetrics / Prometheus.
+#[derive(Deserialize, Debug, Clone)]
+pub struct MetricsPushFileConfig {
+    /// Single push URL (backward compat), e.g. "http://user:pass@vm:8428/api/v1/import/prometheus"
+    pub url: Option<String>,
+    /// Multiple push URLs
+    pub urls: Option<Vec<String>>,
+    /// Push interval in seconds (default: 15)
+    pub interval_secs: Option<u64>,
+}
+
+impl MetricsPushFileConfig {
+    /// Merge `url` (singular) and `urls` (plural) into a single list.
+    pub fn all_urls(&self) -> Vec<String> {
+        if let Some(ref urls) = self.urls {
+            urls.clone()
+        } else if let Some(ref url) = self.url {
+            vec![url.clone()]
         } else {
             vec![]
         }

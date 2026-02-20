@@ -561,6 +561,33 @@ async fn async_main() -> anyhow::Result<()> {
         server::selfsign::spawn_refresh_task(resolver, h3_endpoint);
     }
 
+    // --- Metrics push ---
+    // Merge URLs from CLI and config file; if both define an interval, take the smaller.
+    {
+        let mut push_urls: Vec<String> = args.metrics_push_url.clone();
+        let mut interval_secs: Option<u64> = args.metrics_push_interval_secs;
+
+        if let Some(ref mp) = file_config.as_ref().and_then(|c| c.metrics_push.as_ref()) {
+            push_urls.extend(mp.all_urls());
+            if let Some(cfg_interval) = mp.interval_secs {
+                interval_secs = Some(match interval_secs {
+                    Some(cli_interval) => cli_interval.min(cfg_interval),
+                    None => cfg_interval,
+                });
+            }
+        }
+
+        if !push_urls.is_empty() {
+            let interval = std::time::Duration::from_secs(interval_secs.unwrap_or(15));
+            info!(
+                "Starting metrics push to {} target(s), interval={}s",
+                push_urls.len(),
+                interval.as_secs()
+            );
+            metrics::spawn_metrics_push(push_urls, interval);
+        }
+    }
+
     info!("All servers started. Press Ctrl+C to stop.");
 
     // Wait for all servers (they run indefinitely)
