@@ -51,9 +51,9 @@ pub fn gather_minio_compat_metrics() -> String {
         .sum();
 
     format!(
-        "# HELP minio_bucket_api_traffic_sent_bytes Total number of bytes sent\n\
-         # TYPE minio_bucket_api_traffic_sent_bytes counter\n\
-         minio_bucket_api_traffic_sent_bytes{{bucket=\"dfs\",type=\"s3\"}} {total_bytes}\n\
+        "# HELP minio_bucket_api_traffic_received_bytes Total number of bytes sent\n\
+         # TYPE minio_bucket_api_traffic_received_bytes counter\n\
+         minio_bucket_api_traffic_received_bytes{{bucket=\"dfs\",type=\"s3\"}} {total_bytes}\n\
          # HELP minio_bucket_api_total Total number of requests\n\
          # TYPE minio_bucket_api_total counter\n\
          minio_bucket_api_total{{bucket=\"dfs\",name=\"GetObject\",type=\"s3\"}} {total_requests}\n"

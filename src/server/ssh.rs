@@ -63,9 +63,10 @@ pub async fn serve(
     let addr = format!("[::]:{port}");
     info!("SSH server listening on ssh://{addr}");
 
+    let listener = super::bind_dual_stack_tcp(port)?;
     let mut server = SshServer { app, auth, root, prefix };
     server
-        .run_on_address(Arc::new(config), ("::", port))
+        .run_on_socket(Arc::new(config), &listener)
         .await
         .map_err(|e| anyhow::anyhow!("SSH server error: {e}"))?;
 

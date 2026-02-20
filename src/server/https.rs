@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
 use axum::Router;
-use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 use tower::Service;
 use tracing::info;
@@ -17,9 +16,8 @@ pub async fn serve(
 ) -> anyhow::Result<()> {
     let tls_acceptor = TlsAcceptor::from(rustls_config);
 
-    let addr = format!("[::]:{port}");
-    let listener = TcpListener::bind(&addr).await?;
-    info!("HTTPS server listening on https://{addr}");
+    let listener = super::bind_dual_stack_tcp(port)?;
+    info!("HTTPS server listening on https://[::]:{port}");
 
     loop {
         let (tcp_stream, peer_addr) = listener.accept().await?;
