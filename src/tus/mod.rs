@@ -15,6 +15,8 @@ use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
+use crate::path_policy::PathPolicy;
+
 /// Supported TUS checksum algorithms.
 pub const SUPPORTED_CHECKSUM_ALGORITHMS: &[&str] = &["sha1", "md5"];
 
@@ -87,11 +89,12 @@ pub struct TusUploadManager {
     temp_dir: PathBuf,
     sessions: Arc<RwLock<HashMap<String, TusSession>>>,
     config: TusConfig,
+    path_policy: Arc<PathPolicy>,
 }
 
 impl TusUploadManager {
     /// Create a new upload manager, ensuring the temp directory exists.
-    pub fn new(temp_dir: PathBuf, config: TusConfig) -> Result<Self> {
+    pub fn new(temp_dir: PathBuf, config: TusConfig, path_policy: Arc<PathPolicy>) -> Result<Self> {
         std::fs::create_dir_all(&temp_dir)
             .with_context(|| format!("Failed to create TUS temp directory: {:?}", temp_dir))?;
 
@@ -101,6 +104,7 @@ impl TusUploadManager {
             temp_dir,
             sessions: Arc::new(RwLock::new(HashMap::new())),
             config,
+            path_policy,
         })
     }
 
@@ -256,6 +260,11 @@ impl TusUploadManager {
 
         let target_path = session.target_path.clone();
         let temp_file = session.temp_file.clone();
+
+        let target_path = self
+            .path_policy
+            .resolve_for_create(&target_path)
+            .map_err(|err| anyhow::anyhow!("Target path outside allowed roots: {err}"))?;
 
         // Ensure target directory exists
         if let Some(parent) = target_path.parent() {

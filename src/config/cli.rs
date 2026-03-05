@@ -11,6 +11,11 @@ pub struct Args {
     #[arg(long, default_value = ".")]
     pub root: String,
 
+    /// Allow symlink/junction targets under this real directory tree.
+    /// Can be specified multiple times.
+    #[arg(long, action = clap::ArgAction::Append)]
+    pub allow_link_target: Vec<String>,
+
     /// HTTP port (plain, unencrypted)
     #[arg(long)]
     pub http_port: Option<u16>,
@@ -162,6 +167,19 @@ impl Args {
         }
         if !root.is_dir() {
             anyhow::bail!("Root path '{}' is not a directory", self.root);
+        }
+
+        for target in &self.allow_link_target {
+            let path = std::path::Path::new(target);
+            if !path.exists() {
+                anyhow::bail!("Allow link target '{}' does not exist", target);
+            }
+            if !path.is_dir() {
+                anyhow::bail!("Allow link target '{}' is not a directory", target);
+            }
+            let _ = path.canonicalize().map_err(|e| {
+                anyhow::anyhow!("Failed to canonicalize allow link target '{}': {e}", target)
+            })?;
         }
 
         // username and password must both be set or both unset

@@ -6,6 +6,8 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use tracing::{debug, warn};
 
+use crate::path_policy::{PathPolicy, PathPolicyError};
+
 // ---------------------------------------------------------------------------
 // Data structures
 // ---------------------------------------------------------------------------
@@ -19,6 +21,8 @@ pub struct RtcState {
     pub root: PathBuf,
     /// URL prefix to strip from paths (e.g. "/dav").
     pub prefix: String,
+    /// Shared filesystem path policy.
+    pub path_policy: std::sync::Arc<PathPolicy>,
 }
 
 /// A single ICE candidate as sent by the browser (`RTCIceCandidate`).
@@ -79,6 +83,15 @@ pub async fn lock_handler(
     // Resolve the file path on disk.
     let rel = path.trim_start_matches('/');
     let file_path = rtc_state.root.join(rel);
+    let file_path = match rtc_state.path_policy.resolve_existing(&file_path) {
+        Ok(path) => path,
+        Err(PathPolicyError::Forbidden { .. }) => {
+            return error_response(StatusCode::FORBIDDEN, format!("Forbidden path: /{rel}"));
+        }
+        Err(_) => {
+            return error_response(StatusCode::NOT_FOUND, format!("File not found: /{rel}"));
+        }
+    };
 
     match tokio::fs::metadata(&file_path).await {
         Ok(meta) if meta.is_file() => { /* ok */ }

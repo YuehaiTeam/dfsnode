@@ -3,6 +3,7 @@ mod config;
 mod dav;
 mod metrics;
 mod panic_recovery;
+mod path_policy;
 mod rtc;
 mod server;
 mod stun;
@@ -25,6 +26,7 @@ use crate::config::cli::Args;
 use crate::config::{FileConfig, load_config};
 use crate::dav::ChecksumAwareFileSystem;
 use crate::dav::checksum::{ChecksumAlgorithm, ChecksumManager};
+use crate::path_policy::PathPolicy;
 use crate::server::selfsign::RotatingCertResolver;
 use crate::stun::StunConfig;
 use crate::tus::{TusConfig, TusUploadManager};
@@ -36,6 +38,7 @@ fn build_router(
     auth: AuthConfig,
     tus_manager: Option<Arc<TusUploadManager>>,
     rtc_state: Option<rtc::handler::RtcState>,
+    path_policy: Arc<PathPolicy>,
 ) -> Router {
     let inner = LocalFs::new(root, true, false, false);
     let checksum_manager = ChecksumManager::new(vec![
@@ -43,7 +46,7 @@ fn build_router(
         ChecksumAlgorithm::MD5,
     ]);
 
-    let fs = ChecksumAwareFileSystem::new(inner, checksum_manager, root.to_path_buf());
+    let fs = ChecksumAwareFileSystem::new(inner, checksum_manager, root.to_path_buf(), path_policy.clone());
 
     let mut builder = DavHandler::builder()
         .filesystem(Box::new(fs));
@@ -119,7 +122,7 @@ fn build_router(
 
     // If TUS is enabled, merge TUS routes BEFORE the DavHandler fallback
     if let Some(mgr) = tus_manager {
-        router = router.merge(tus_routes(prefix, mgr, root.to_path_buf()));
+        router = router.merge(tus_routes(prefix, mgr, root.to_path_buf(), path_policy));
     }
 
     // Build the fallback that handles both LOCK (WebRTC signaling) and
@@ -265,6 +268,7 @@ async fn async_main() -> anyhow::Result<()> {
 
     let root = PathBuf::from(&args.root).canonicalize()?;
     info!("Serving directory: {}", root.display());
+    let path_policy = Arc::new(PathPolicy::new(root.clone(), &args.allow_link_target)?);
 
     // Load config file or use CLI args
     let file_config: Option<FileConfig> = if let Some(config_path) = &args.config {
@@ -292,7 +296,7 @@ async fn async_main() -> anyhow::Result<()> {
         if let Some(ref tus_file) = fc.tus {
             let (tus_config, temp_dir) = build_tus_from_config(tus_file, &root);
             if tus_config.enabled {
-                let mgr = TusUploadManager::new(temp_dir, tus_config)?;
+                let mgr = TusUploadManager::new(temp_dir, tus_config, path_policy.clone())?;
                 info!("TUS resumable uploads enabled");
                 Some(Arc::new(mgr))
             } else {
@@ -347,10 +351,18 @@ async fn async_main() -> anyhow::Result<()> {
             rtc_handle: handle.clone(),
             root: root.clone(),
             prefix: args.prefix.clone(),
+            path_policy: path_policy.clone(),
         }
     });
 
-    let app = build_router(&root, &args.prefix, auth.clone(), tus_manager, rtc_state_for_router);
+    let app = build_router(
+        &root,
+        &args.prefix,
+        auth.clone(),
+        tus_manager,
+        rtc_state_for_router,
+        path_policy.clone(),
+    );
 
     // Resolve the ClientIpSource for real-ip support.
     // CLI --real-ip takes priority over config file real_ip field.
@@ -487,8 +499,19 @@ async fn async_main() -> anyhow::Result<()> {
         let ssh_auth = auth.clone();
         let ssh_root = root.clone();
         let ssh_prefix = args.prefix.clone();
+        let ssh_path_policy = path_policy.clone();
         handles.push(panic_recovery::spawn_catch_panic("ssh-server", async move {
-            if let Err(e) = server::ssh::serve(port, &PathBuf::from(host_key), ssh_app, ssh_auth, ssh_root, ssh_prefix).await {
+            if let Err(e) = server::ssh::serve(
+                port,
+                &PathBuf::from(host_key),
+                ssh_app,
+                ssh_auth,
+                ssh_root,
+                ssh_prefix,
+                ssh_path_policy,
+            )
+            .await
+            {
                 tracing::error!("SSH server error: {e}");
             }
         }));
@@ -523,6 +546,7 @@ async fn async_main() -> anyhow::Result<()> {
             auth: auth.clone(),
             root: root.clone(),
             prefix: args.prefix.clone(),
+            path_policy: path_policy.clone(),
         };
         let h3_handle = server::http3::spawn(port, quic_config, h3_app, stun_config, wt_config, rtc_tx_for_h3)?;
 

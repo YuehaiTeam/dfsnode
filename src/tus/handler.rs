@@ -9,6 +9,7 @@ use axum::routing::{head, options};
 use axum::Router;
 use tracing::{debug, info, warn};
 
+use crate::path_policy::PathPolicyError;
 use crate::tus::{TusUploadManager, decode_tus_metadata};
 
 /// Shared state for TUS handlers.
@@ -17,12 +18,18 @@ pub struct TusState {
     pub manager: Arc<TusUploadManager>,
     pub root: PathBuf,
     pub prefix: String,
+    pub path_policy: Arc<crate::path_policy::PathPolicy>,
 }
 
 /// Build axum routes for TUS resumable uploads.
 ///
 /// All routes are mounted under `{prefix}/.tus-uploads`.
-pub fn tus_routes(prefix: &str, manager: Arc<TusUploadManager>, root: PathBuf) -> Router {
+pub fn tus_routes(
+    prefix: &str,
+    manager: Arc<TusUploadManager>,
+    root: PathBuf,
+    path_policy: Arc<crate::path_policy::PathPolicy>,
+) -> Router {
     let prefix_clean = prefix.trim_end_matches('/').to_string();
     let tus_base = format!("{}/.tus-uploads", prefix_clean);
 
@@ -30,6 +37,7 @@ pub fn tus_routes(prefix: &str, manager: Arc<TusUploadManager>, root: PathBuf) -
         manager,
         root,
         prefix: prefix_clean,
+        path_policy,
     };
 
     Router::new()
@@ -182,6 +190,25 @@ async fn tus_create(
     }
 
     let target_path = state.root.join(&rel_path);
+    let target_path = match state.path_policy.resolve_for_create(&target_path) {
+        Ok(path) => path,
+        Err(PathPolicyError::Forbidden { .. }) => {
+            return (
+                StatusCode::FORBIDDEN,
+                [("tus-resumable", "1.0.0")],
+                "Forbidden: path outside allowed roots",
+            )
+                .into_response();
+        }
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                [("tus-resumable", "1.0.0")],
+                "Invalid upload target path",
+            )
+                .into_response();
+        }
+    };
 
     info!(
         "Creating TUS upload session: target={:?}, size={}",
@@ -330,10 +357,19 @@ async fn tus_patch(
         Ok(session) if session.is_complete() => {
             if let Err(e) = state.manager.finalize_upload(&session_id).await {
                 warn!("Failed to finalize upload: {}", e);
+                let msg = e.to_string();
+                if msg.contains("outside allowed roots") {
+                    return (
+                        StatusCode::FORBIDDEN,
+                        [("tus-resumable", "1.0.0")],
+                        msg,
+                    )
+                        .into_response();
+                }
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     [("tus-resumable", "1.0.0")],
-                    format!("Failed to finalize upload: {e}"),
+                    format!("Failed to finalize upload: {msg}"),
                 )
                     .into_response();
             }

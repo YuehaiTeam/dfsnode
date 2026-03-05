@@ -6,6 +6,7 @@ use tracing::{debug, info, warn};
 
 use crate::auth::{AuthConfig, extract_sign_param};
 use crate::metrics::MetricsGuard;
+use crate::path_policy::PathPolicy;
 
 /// Configuration needed for WebTransport file download.
 #[derive(Clone)]
@@ -16,6 +17,8 @@ pub struct WtConfig {
     pub root: PathBuf,
     /// URL prefix to strip.
     pub prefix: String,
+    /// Shared filesystem path policy.
+    pub path_policy: std::sync::Arc<PathPolicy>,
 }
 
 /// Handle a WebTransport session: verify signature → accept → open uni stream → push file → close.
@@ -64,16 +67,11 @@ pub async fn handle_webtransport(
     let rel = stripped.strip_prefix('/').unwrap_or(stripped);
     let file_path = wt_config.root.join(rel);
 
-    // Canonicalize both root and target to prevent ../ traversal
-    let canonical_root = wt_config
-        .root
-        .canonicalize()
-        .unwrap_or_else(|_| wt_config.root.clone());
-    let canonical_file = match file_path.canonicalize() {
-        Ok(p) if p.starts_with(&canonical_root) && p.is_file() => p,
+    let canonical_file = match wt_config.path_policy.resolve_existing(&file_path) {
+        Ok(path) if path.is_file() => path,
         _ => {
             warn!(
-                "WebTransport: file not accessible or outside root: {}",
+                "WebTransport: file not accessible or outside allowed roots: {}",
                 file_path.display()
             );
             drop(session);

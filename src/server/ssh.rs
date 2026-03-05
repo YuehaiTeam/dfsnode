@@ -10,6 +10,7 @@ use russh::{Channel, ChannelId};
 use tower::Service;
 use tracing::{debug, info, warn};
 use crate::auth::AuthConfig;
+use crate::path_policy::PathPolicy;
 
 use super::sftp::{SftpAccess, SftpHandler};
 
@@ -22,6 +23,7 @@ pub async fn serve(
     auth: AuthConfig,
     root: PathBuf,
     prefix: String,
+    path_policy: Arc<PathPolicy>,
 ) -> anyhow::Result<()> {
     let host_key = if host_key_path.exists() {
         russh::keys::load_secret_key(host_key_path, None)
@@ -64,7 +66,13 @@ pub async fn serve(
     info!("SSH server listening on ssh://{addr}");
 
     let listener = super::bind_dual_stack_tcp(port)?;
-    let mut server = SshServer { app, auth, root, prefix };
+    let mut server = SshServer {
+        app,
+        auth,
+        root,
+        prefix,
+        path_policy,
+    };
     server
         .run_on_socket(Arc::new(config), &listener)
         .await
@@ -80,6 +88,7 @@ struct SshServer {
     auth: AuthConfig,
     root: PathBuf,
     prefix: String,
+    path_policy: Arc<PathPolicy>,
 }
 
 impl russh::server::Server for SshServer {
@@ -93,6 +102,7 @@ impl russh::server::Server for SshServer {
             auth: self.auth.clone(),
             root: self.root.clone(),
             prefix: self.prefix.clone(),
+            path_policy: self.path_policy.clone(),
             auth_mode: AuthMode::None,
             channels: HashMap::new(),
         }
@@ -119,6 +129,7 @@ struct SshHandler {
     auth: AuthConfig,
     root: PathBuf,
     prefix: String,
+    path_policy: Arc<PathPolicy>,
     auth_mode: AuthMode,
     channels: HashMap<ChannelId, Channel<Msg>>,
 }
@@ -231,13 +242,18 @@ impl russh::server::Handler for SshHandler {
                 session.channel_success(channel_id).ok();
                 let access = match &self.auth_mode {
                     AuthMode::None | AuthMode::WebDav => {
-                        SftpAccess::full(self.root.clone(), self.prefix.clone())
+                        SftpAccess::full(
+                            self.root.clone(),
+                            self.prefix.clone(),
+                            self.path_policy.clone(),
+                        )
                     }
                     AuthMode::Signature { path, .. } => {
                         SftpAccess::single_file(
                             self.root.clone(),
                             self.prefix.clone(),
                             path.clone(),
+                            self.path_policy.clone(),
                         )
                     }
                 };

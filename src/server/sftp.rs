@@ -12,11 +12,14 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use russh_sftp::protocol::{
     Attrs, Data, File as SftpFile, FileAttributes, Handle, Name, OpenFlags, Status, StatusCode,
 };
 use std::future::Future;
+
+use crate::path_policy::{PathPolicy, PathPolicyError};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -36,13 +39,18 @@ const MAX_HANDLES: usize = 256;
 #[derive(Clone, Debug)]
 pub(crate) enum SftpAccess {
     /// WebDAV / no-auth login — read-only access to entire root.
-    FullAccess { root: PathBuf, prefix: String },
+    FullAccess {
+        root: PathBuf,
+        prefix: String,
+        path_policy: Arc<PathPolicy>,
+    },
     /// Signature login — read-only access to a single file.
     /// `dav_path` is the prefix-stripped relative path (e.g. "/foo.txt").
     /// The file is visible at `{prefix}{dav_path}` and `/data.bin` (at absolute root).
     SingleFile {
         root: PathBuf,
         prefix: String,
+        path_policy: Arc<PathPolicy>,
         dav_path: String,
         real_path: PathBuf,
     },
@@ -50,21 +58,32 @@ pub(crate) enum SftpAccess {
 
 impl SftpAccess {
     /// Create a full-access mode.
-    pub fn full(root: PathBuf, prefix: String) -> Self {
-        Self::FullAccess { root, prefix }
+    pub fn full(root: PathBuf, prefix: String, path_policy: Arc<PathPolicy>) -> Self {
+        Self::FullAccess {
+            root,
+            prefix,
+            path_policy,
+        }
     }
 
     /// Create a single-file access mode.
     /// `full_path` is the path with prefix (e.g. "/dav/foo.txt").
-    pub fn single_file(root: PathBuf, prefix: String, full_path: String) -> Self {
+    pub fn single_file(
+        root: PathBuf,
+        prefix: String,
+        full_path: String,
+        path_policy: Arc<PathPolicy>,
+    ) -> Self {
         let dav_path = strip_prefix_path(&full_path, &prefix);
         let rel = dav_path.trim_start_matches('/');
         let real_path = root.join(rel);
-        // Canonicalize real_path and validate within root for safety.
-        let real_path = real_path.canonicalize().unwrap_or_else(|_| root.join(rel));
+        let real_path = path_policy
+            .resolve_existing(&real_path)
+            .unwrap_or_else(|_| root.join(rel));
         Self::SingleFile {
             root,
             prefix,
+            path_policy,
             dav_path,
             real_path,
         }
@@ -79,6 +98,14 @@ impl SftpAccess {
     fn root(&self) -> &Path {
         match self {
             Self::FullAccess { root, .. } | Self::SingleFile { root, .. } => root,
+        }
+    }
+
+    fn path_policy(&self) -> &PathPolicy {
+        match self {
+            Self::FullAccess { path_policy, .. } | Self::SingleFile { path_policy, .. } => {
+                path_policy.as_ref()
+            }
         }
     }
 }
@@ -162,9 +189,8 @@ impl SftpHandler {
     }
 
     /// Resolve an SFTP path to a physical filesystem path.
-    /// Returns `None` if path is outside prefix or escapes root.
-    fn resolve_path(&self, sftp_path: &str) -> Option<PathBuf> {
-        let dav_path = self.strip_prefix(sftp_path)?;
+    fn resolve_path(&self, sftp_path: &str) -> Result<PathBuf, StatusCode> {
+        let dav_path = self.strip_prefix(sftp_path).ok_or(StatusCode::NoSuchFile)?;
         let rel = dav_path.trim_start_matches('/');
         let root = self.access.root();
         let full = if rel.is_empty() {
@@ -172,33 +198,15 @@ impl SftpHandler {
         } else {
             root.join(rel)
         };
-        // Canonicalize and verify within root to prevent directory traversal.
-        let canonical_root = root.canonicalize().ok()?;
-        let canonical = if full.exists() {
-            full.canonicalize().ok()?
-        } else {
-            // For non-existent paths, canonicalize the parent and re-join.
-            let parent = full.parent()?;
-            if !parent.exists() {
-                return None;
-            }
-            let file_name = full.file_name()?;
-            let canonical_parent = parent.canonicalize().ok()?;
-            if !canonical_parent.starts_with(&canonical_root) {
-                return None;
-            }
-            canonical_parent.join(file_name)
-        };
-        if canonical.starts_with(&canonical_root) {
-            Some(canonical)
-        } else {
-            None
-        }
+        self.access
+            .path_policy()
+            .resolve_existing(&full)
+            .map_err(map_policy_error)
     }
 
     /// Check if an SFTP path is allowed under the current access mode.
     /// Returns the resolved physical path if allowed.
-    fn check_access(&self, sftp_path: &str) -> Option<PathBuf> {
+    fn check_access(&self, sftp_path: &str) -> Result<PathBuf, StatusCode> {
         // Normalize trailing slashes
         let path = sftp_path.trim_end_matches('/');
         let path = if path.is_empty() { "/" } else { path };
@@ -209,11 +217,11 @@ impl SftpHandler {
                 if path == "/" {
                     let prefix = self.access.prefix().trim_end_matches('/');
                     if prefix.is_empty() {
-                        return Some(self.access.root().to_path_buf());
+                        return Ok(self.access.root().to_path_buf());
                     }
                     // "/" in FullAccess with prefix: not directly accessible
                     // (client should use the prefix path)
-                    return None;
+                    return Err(StatusCode::NoSuchFile);
                 }
                 self.resolve_path(path)
             }
@@ -222,38 +230,35 @@ impl SftpHandler {
                 real_path,
                 ..
             } => {
-                // Validate real_path is within root (defense in depth)
-                let canonical_root = self.access.root().canonicalize().ok()?;
-                let canonical_real = real_path.canonicalize().ok()?;
-                if !canonical_real.starts_with(&canonical_root) {
-                    return None;
+                if let Err(err) = self.access.path_policy().resolve_existing(real_path) {
+                    return Err(map_policy_error(err));
                 }
 
                 // /data.bin is at absolute root, NOT under prefix
                 if path == "/data.bin" {
-                    return Some(real_path.clone());
+                    return Ok(real_path.clone());
                 }
                 // / (root) is always allowed as virtual directory
                 if path == "/" {
-                    return Some(self.access.root().to_path_buf());
+                    return Ok(self.access.root().to_path_buf());
                 }
 
-                let stripped = self.strip_prefix(path)?;
+                let stripped = self.strip_prefix(path).ok_or(StatusCode::NoSuchFile)?;
 
                 // Prefix root directory
                 if stripped == "/" {
-                    return Some(self.access.root().to_path_buf());
+                    return Ok(self.access.root().to_path_buf());
                 }
                 if stripped == *dav_path {
-                    return Some(real_path.clone());
+                    return Ok(real_path.clone());
                 }
                 // Check intermediate directories in the original path.
                 if dav_path.starts_with(&stripped as &str)
                     && dav_path[stripped.len()..].starts_with('/')
                 {
-                    return Some(self.access.root().to_path_buf());
+                    return Ok(self.access.root().to_path_buf());
                 }
-                None
+                Err(StatusCode::NoSuchFile)
             }
         }
     }
@@ -355,7 +360,7 @@ impl russh_sftp::server::Handler for SftpHandler {
                 if self.handles.len() >= MAX_HANDLES {
                     return Err(StatusCode::Failure);
                 }
-                let physical = self.check_access(&filename).ok_or(StatusCode::NoSuchFile)?;
+                let physical = self.check_access(&filename)?;
                 if !physical.is_file() {
                     return Err(StatusCode::NoSuchFile);
                 }
@@ -476,7 +481,7 @@ impl russh_sftp::server::Handler for SftpHandler {
             if self.handles.len() >= MAX_HANDLES {
                 return Err(StatusCode::Failure);
             }
-            let _ = self.check_access(&path).ok_or(StatusCode::NoSuchFile)?;
+            let _ = self.check_access(&path)?;
             if !self.is_dir(&path) {
                 return Err(StatusCode::NoSuchFile);
             }
@@ -539,7 +544,7 @@ impl russh_sftp::server::Handler for SftpHandler {
             } else {
                 path.clone()
             };
-            let _ = self.check_access(&resolved).ok_or(StatusCode::NoSuchFile)?;
+            let _ = self.check_access(&resolved)?;
             let is_dir = self.is_dir(&resolved);
             Ok(Name {
                 id,
@@ -637,7 +642,7 @@ impl russh_sftp::server::Handler for SftpHandler {
 
 impl SftpHandler {
     fn do_stat(&self, id: u32, path: &str) -> Result<Attrs, StatusCode> {
-        let physical = self.check_access(path).ok_or(StatusCode::NoSuchFile)?;
+        let physical = self.check_access(path)?;
         let is_dir = self.is_dir(path);
 
         if is_dir {
@@ -676,7 +681,7 @@ impl SftpHandler {
 
     /// FullAccess: list physical directory but construct all attributes.
     fn build_full_access_dir(&self, sftp_path: &str) -> Result<Vec<SftpFile>, StatusCode> {
-        let physical = self.resolve_path(sftp_path).ok_or(StatusCode::NoSuchFile)?;
+        let physical = self.resolve_path(sftp_path)?;
         let read_dir = std::fs::read_dir(&physical).map_err(|_| StatusCode::PermissionDenied)?;
 
         let mut entries = vec![make_sftp_file(".", 0, true), make_sftp_file("..", 0, true)];
@@ -689,16 +694,15 @@ impl SftpHandler {
                 continue;
             };
 
-            // Skip symlinks
-            if ft.is_symlink() {
-                continue;
-            }
-
-            let is_dir = ft.is_dir();
+            let metadata = entry.metadata().ok();
+            let is_dir = metadata
+                .as_ref()
+                .map(|meta| meta.is_dir())
+                .unwrap_or_else(|| ft.is_dir());
             let size = if is_dir {
                 0
             } else {
-                entry.metadata().map(|m| m.len()).unwrap_or(0)
+                metadata.as_ref().map(|meta| meta.len()).unwrap_or(0)
             };
             entries.push(make_sftp_file(&name, size, is_dir));
         }
@@ -830,5 +834,13 @@ fn strip_prefix_path(path: &str, prefix: &str) -> String {
         }
     } else {
         path.to_string()
+    }
+}
+
+fn map_policy_error(err: PathPolicyError) -> StatusCode {
+    if err.is_forbidden() {
+        StatusCode::PermissionDenied
+    } else {
+        StatusCode::NoSuchFile
     }
 }
