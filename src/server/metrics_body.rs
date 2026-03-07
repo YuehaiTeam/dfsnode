@@ -1,6 +1,7 @@
 use std::net::IpAddr;
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use std::time::Instant;
 
 use bytes::Buf;
 use http_body::{Body, Frame};
@@ -20,6 +21,10 @@ use crate::metrics;
 pub struct MetricsBody<B> {
     inner: B,
     bytes_sent: u64,
+    flushed_bytes: u64,
+    last_flush_at: Instant,
+    start_send_at: Option<Instant>,
+    last_send_at: Option<Instant>,
     protocol: &'static str,
     /// If true, skip recording metrics (e.g. for /-/metrics endpoint itself).
     skip: bool,
@@ -48,6 +53,10 @@ impl<B> MetricsBody<B> {
         Self {
             inner,
             bytes_sent: header_bytes,
+            flushed_bytes: 0,
+            last_flush_at: Instant::now(),
+            start_send_at: None,
+            last_send_at: None,
             protocol,
             skip,
             peer_ip,
@@ -75,7 +84,36 @@ where
         match inner.poll_frame(cx) {
             Poll::Ready(Some(Ok(frame))) => {
                 if let Some(data) = frame.data_ref() {
+                    if this.skip {
+                        return Poll::Ready(Some(Ok(frame)));
+                    }
+
+                    let now = Instant::now();
+                    if this.start_send_at.is_none() {
+                        this.start_send_at = Some(now);
+                        metrics::flush_pending_bytes(
+                            this.protocol,
+                            this.bytes_sent,
+                            &mut this.flushed_bytes,
+                            &mut this.last_flush_at,
+                        );
+                    }
+                    this.last_send_at = Some(now);
+
                     this.bytes_sent = this.bytes_sent.saturating_add(data.remaining() as u64);
+
+                    if metrics::should_flush_bytes(
+                        this.bytes_sent,
+                        this.flushed_bytes,
+                        this.last_flush_at,
+                    ) {
+                        metrics::flush_pending_bytes(
+                            this.protocol,
+                            this.bytes_sent,
+                            &mut this.flushed_bytes,
+                            &mut this.last_flush_at,
+                        );
+                    }
                 }
                 Poll::Ready(Some(Ok(frame)))
             }
@@ -99,7 +137,18 @@ impl<B> Drop for MetricsBody<B> {
         }
 
         metrics::record_request(self.protocol);
-        metrics::record_bytes_sent(self.protocol, self.bytes_sent);
+        metrics::flush_pending_bytes(
+            self.protocol,
+            self.bytes_sent,
+            &mut self.flushed_bytes,
+            &mut self.last_flush_at,
+        );
+
+        let (elapsed_ms, avg_bps) = metrics::elapsed_ms_and_avg_bps_between(
+            self.start_send_at,
+            self.last_send_at,
+            self.bytes_sent,
+        );
 
         let ip_str = self
             .peer_ip
@@ -108,8 +157,8 @@ impl<B> Drop for MetricsBody<B> {
         let uuid_str = self.uuid.as_deref().unwrap_or("-");
 
         info!(
-            "[{}] {} {} {} {}",
-            self.protocol, ip_str, self.path, self.bytes_sent, uuid_str,
+            "[{}] {} {} {} {} {}ms {}bps",
+            self.protocol, ip_str, self.path, self.bytes_sent, uuid_str, elapsed_ms, avg_bps,
         );
 
         debug!("[{}] {} bytes sent", self.protocol, self.bytes_sent,);

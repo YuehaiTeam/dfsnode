@@ -2,7 +2,12 @@ use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
 use lazy_static::lazy_static;
 use prometheus::{register_int_counter_vec, Encoder, IntCounterVec, TextEncoder};
 use serde::Deserialize;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+/// Flush bytes counter when pending bytes reaches this threshold.
+pub const STREAMING_FLUSH_BYTES_THRESHOLD: u64 = 8 * 1024 * 1024;
+/// Flush bytes counter at least this often during active sending.
+pub const STREAMING_FLUSH_INTERVAL: Duration = Duration::from_millis(500);
 
 lazy_static! {
     /// Total number of requests by protocol.
@@ -106,6 +111,61 @@ pub fn record_bytes_sent(protocol: &str, bytes: u64) {
     }
 }
 
+/// Compute elapsed milliseconds and average bytes/sec for a single transfer.
+///
+/// - `start_send_at`: the timestamp when sending actually started.
+/// - `bytes_sent`: total bytes sent for this request/session.
+pub fn elapsed_ms_and_avg_bps_between(
+    start_send_at: Option<Instant>,
+    end_send_at: Option<Instant>,
+    bytes_sent: u64,
+) -> (u64, u64) {
+    let (Some(start), Some(end)) = (start_send_at, end_send_at) else {
+        return (0, 0);
+    };
+
+    let elapsed_ms = end.saturating_duration_since(start).as_millis() as u64;
+    if elapsed_ms == 0 {
+        return (0, 0);
+    }
+
+    (elapsed_ms, bytes_sent.saturating_mul(1000) / elapsed_ms)
+}
+
+/// Compute elapsed milliseconds and average bytes/sec using `Instant::now()`
+/// as transfer end time.
+pub fn elapsed_ms_and_avg_bps(start_send_at: Option<Instant>, bytes_sent: u64) -> (u64, u64) {
+    elapsed_ms_and_avg_bps_between(start_send_at, Some(Instant::now()), bytes_sent)
+}
+
+/// Return true when pending bytes should be flushed to the Prometheus counter.
+pub fn should_flush_bytes(total_bytes: u64, flushed_bytes: u64, last_flush_at: Instant) -> bool {
+    if total_bytes <= flushed_bytes {
+        return false;
+    }
+
+    let pending = total_bytes - flushed_bytes;
+    pending >= STREAMING_FLUSH_BYTES_THRESHOLD
+        || last_flush_at.elapsed() >= STREAMING_FLUSH_INTERVAL
+}
+
+/// Flush pending bytes delta to the Prometheus counter.
+pub fn flush_pending_bytes(
+    protocol: &str,
+    total_bytes: u64,
+    flushed_bytes: &mut u64,
+    last_flush_at: &mut Instant,
+) {
+    if total_bytes <= *flushed_bytes {
+        return;
+    }
+
+    let delta = total_bytes - *flushed_bytes;
+    record_bytes_sent(protocol, delta);
+    *flushed_bytes = total_bytes;
+    *last_flush_at = Instant::now();
+}
+
 /// RAII guard that records request count and bytes sent on Drop.
 ///
 /// Use this for protocols where the response body is not automatically polled
@@ -114,6 +174,9 @@ pub fn record_bytes_sent(protocol: &str, bytes: u64) {
 pub struct MetricsGuard {
     protocol: &'static str,
     bytes_sent: u64,
+    flushed_bytes: u64,
+    last_flush_at: Instant,
+    start_send_at: Option<Instant>,
     recorded: bool,
     /// If true, only record bytes_sent on Drop (request count handled elsewhere).
     bytes_only: bool,
@@ -125,6 +188,9 @@ impl MetricsGuard {
         Self {
             protocol,
             bytes_sent: 0,
+            flushed_bytes: 0,
+            last_flush_at: Instant::now(),
+            start_send_at: None,
             recorded: false,
             bytes_only: false,
         }
@@ -139,24 +205,73 @@ impl MetricsGuard {
         Self {
             protocol,
             bytes_sent: 0,
+            flushed_bytes: 0,
+            last_flush_at: Instant::now(),
+            start_send_at: None,
             recorded: false,
             bytes_only: true,
         }
     }
 
+    /// Mark the transfer as started.
+    pub fn mark_send_started(&mut self) {
+        if self.start_send_at.is_none() {
+            self.start_send_at = Some(Instant::now());
+        }
+    }
+
     /// Add bytes to the running total (call after each successful send).
     pub fn add_bytes(&mut self, n: u64) {
+        if n == 0 {
+            return;
+        }
+        self.mark_send_started();
         self.bytes_sent = self.bytes_sent.saturating_add(n);
+        self.maybe_flush();
     }
 
     /// Set the total bytes sent (call when the total is known at once).
     pub fn set_bytes(&mut self, n: u64) {
         self.bytes_sent = n;
+        if n > 0 {
+            self.mark_send_started();
+        }
+        self.maybe_flush();
     }
 
     /// Read current byte count (for logging).
     pub fn bytes_sent_so_far(&self) -> u64 {
         self.bytes_sent
+    }
+
+    /// Flush pending bytes if thresholds are reached.
+    pub fn maybe_flush(&mut self) {
+        if self.recorded {
+            return;
+        }
+
+        if should_flush_bytes(self.bytes_sent, self.flushed_bytes, self.last_flush_at) {
+            flush_pending_bytes(
+                self.protocol,
+                self.bytes_sent,
+                &mut self.flushed_bytes,
+                &mut self.last_flush_at,
+            );
+        }
+    }
+
+    /// Compute elapsed_ms and avg_bps for logging.
+    pub fn elapsed_ms_and_avg_bps(&self) -> (u64, u64) {
+        elapsed_ms_and_avg_bps(self.start_send_at, self.bytes_sent)
+    }
+
+    fn flush_remaining(&mut self) {
+        flush_pending_bytes(
+            self.protocol,
+            self.bytes_sent,
+            &mut self.flushed_bytes,
+            &mut self.last_flush_at,
+        );
     }
 
     /// Explicitly record now and prevent the Drop from recording again.
@@ -165,7 +280,7 @@ impl MetricsGuard {
             if !self.bytes_only {
                 record_request(self.protocol);
             }
-            record_bytes_sent(self.protocol, self.bytes_sent);
+            self.flush_remaining();
             self.recorded = true;
         }
     }
@@ -177,7 +292,7 @@ impl Drop for MetricsGuard {
             if !self.bytes_only {
                 record_request(self.protocol);
             }
-            record_bytes_sent(self.protocol, self.bytes_sent);
+            self.flush_remaining();
         }
     }
 }

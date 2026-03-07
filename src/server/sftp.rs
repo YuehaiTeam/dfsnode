@@ -13,6 +13,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 
 use russh_sftp::protocol::{
     Attrs, Data, File as SftpFile, FileAttributes, Handle, Name, OpenFlags, Status, StatusCode,
@@ -135,6 +136,10 @@ pub(crate) struct SftpHandler {
     uuid: Option<String>,
     /// Last opened file path (SFTP path as seen by the client).
     path: String,
+    /// Timestamp when file data sending actually started.
+    start_send_at: Option<Instant>,
+    /// Timestamp of the most recent successful data send.
+    last_send_at: Option<Instant>,
 }
 
 impl SftpHandler {
@@ -147,6 +152,8 @@ impl SftpHandler {
             peer_addr,
             uuid,
             path: "-".into(),
+            start_send_at: None,
+            last_send_at: None,
         }
     }
 
@@ -419,7 +426,13 @@ impl russh_sftp::server::Handler for SftpHandler {
                 return Err(StatusCode::Eof);
             }
             buf.truncate(n);
-            self.bytes_sent += n as u64;
+            if self.start_send_at.is_none() {
+                self.start_send_at = Some(Instant::now());
+            }
+            self.last_send_at = Some(Instant::now());
+            let sent = n as u64;
+            self.bytes_sent = self.bytes_sent.saturating_add(sent);
+            crate::metrics::record_bytes_sent("sftp", sent);
             Ok(Data { id, data: buf })
         })();
         std::future::ready(result)
@@ -805,15 +818,21 @@ impl Drop for SftpHandler {
             .map(|a| super::normalize_ip(a.ip()).to_string())
             .unwrap_or_else(|| "-".into());
         let uuid_str = self.uuid.as_deref().unwrap_or("-");
+        let (elapsed_ms, avg_bps) = crate::metrics::elapsed_ms_and_avg_bps_between(
+            self.start_send_at,
+            self.last_send_at,
+            self.bytes_sent,
+        );
         tracing::info!(
-            "[sftp] {} {} {} {}",
+            "[sftp] {} {} {} {} {}ms {}bps",
             ip_str,
             self.path,
             self.bytes_sent,
             uuid_str,
+            elapsed_ms,
+            avg_bps,
         );
         crate::metrics::record_request("sftp");
-        crate::metrics::record_bytes_sent("sftp", self.bytes_sent);
     }
 }
 
