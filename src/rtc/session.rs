@@ -9,6 +9,8 @@ use str0m::{Event, IceConnectionState, Input, Output, Rtc};
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
+use crate::metrics::MetricsGuard;
+
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
@@ -229,6 +231,12 @@ pub struct RtcSession {
     uuid: Option<String>,
     /// URI path from the original LOCK request (for access logging).
     uri_path: String,
+    /// Timestamp when transfer sending phase started.
+    transfer_started_at: Option<Instant>,
+    /// Timestamp when the most recent chunk/EOF marker was accepted.
+    last_data_sent_at: Option<Instant>,
+    /// Streaming request/bytes metrics recorder.
+    metrics_guard: MetricsGuard,
 }
 
 impl RtcSession {
@@ -269,6 +277,9 @@ impl RtcSession {
             wake_tx,
             uuid,
             uri_path,
+            transfer_started_at: None,
+            last_data_sent_at: None,
+            metrics_guard: MetricsGuard::new("rtc"),
         }
     }
 
@@ -351,8 +362,11 @@ impl RtcSession {
                     if let Some(mut ch) = self.rtc.channel(cid) {
                         match ch.write(true, &EOF_MARKER) {
                             Ok(true) => {
+                                let now = Instant::now();
                                 self.bytes_sent += EOF_MARKER.len() as u64;
-                                self.last_activity = Instant::now();
+                                self.metrics_guard.add_bytes(EOF_MARKER.len() as u64);
+                                self.last_activity = now;
+                                self.last_data_sent_at = Some(now);
                                 self.eof_marker_sent = true;
                                 self.state = SessionState::Draining;
                                 debug!(
@@ -459,6 +473,8 @@ impl RtcSession {
                 self.channel_id = Some(id);
                 self.state = SessionState::Transferring;
                 self.last_activity = Instant::now();
+                self.transfer_started_at = Some(Instant::now());
+                self.metrics_guard.mark_send_started();
 
                 // Set the buffered amount low threshold so we get notified
                 // when it's safe to resume sending.
@@ -584,10 +600,13 @@ impl RtcSession {
                         break;
                     }
                     Ok(true) => {
+                        let now = Instant::now();
                         // str0m v0.16 write is all-or-nothing.
                         // Framed message includes 8-byte header; count the full message.
                         self.bytes_sent += remaining.len() as u64;
-                        self.last_activity = Instant::now();
+                        self.metrics_guard.add_bytes(remaining.len() as u64);
+                        self.last_activity = now;
+                        self.last_data_sent_at = Some(now);
                         did_write = true;
                         wrote_this_cycle = wrote_this_cycle.saturating_add(remaining.len());
 
@@ -644,6 +663,15 @@ impl RtcSession {
     /// Total bytes sent to the remote peer over the DataChannel.
     pub fn bytes_sent(&self) -> u64 {
         self.bytes_sent
+    }
+
+    /// Elapsed milliseconds and average bytes/sec for this transfer.
+    pub fn elapsed_ms_and_avg_bps(&self) -> (u64, u64) {
+        crate::metrics::elapsed_ms_and_avg_bps_between(
+            self.transfer_started_at,
+            self.last_data_sent_at,
+            self.bytes_sent,
+        )
     }
 
     /// UUID from the request signature, if present.

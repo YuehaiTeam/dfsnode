@@ -478,17 +478,15 @@ impl RtcManager {
 
             if let Some(session) = self.sessions.remove(id) {
                 let sent = session.bytes_sent();
-                let mut guard = crate::metrics::MetricsGuard::new("rtc");
-                guard.set_bytes(sent);
-                // guard Drop will record request + bytes_sent
+                let (elapsed_ms, avg_bps) = session.elapsed_ms_and_avg_bps();
                 let ip_str = peer_ip
                     .map(|ip| ip.to_string())
                     .unwrap_or_else(|| "-".into());
                 let uuid_str = session.uuid().as_deref().unwrap_or("-");
                 let uri_path = session.uri_path();
                 info!(
-                    "[rtc] {} {} {} {}",
-                    ip_str, uri_path, sent, uuid_str,
+                    "[rtc] {} {} {} {} {}ms {}bps",
+                    ip_str, uri_path, sent, uuid_str, elapsed_ms, avg_bps,
                 );
             }
         }
