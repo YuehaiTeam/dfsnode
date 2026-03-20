@@ -120,10 +120,3 @@ debug = "line-tables-only"
 
 [target.'cfg(windows)'.dependencies]
 windows-service = "0.8"
-
-[patch.crates-io]
-# Use local fork of sctp-proto with increased buffer size for high-bandwidth WAN links
-sctp-proto = { path = ".cache/sctp-proto" }
-
-# Patch str0m to raise SCTP buffered cap for DataChannel throughput.
-str0m = { path = ".cache/str0m-0.16.2" }
