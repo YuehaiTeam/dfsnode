@@ -5,9 +5,11 @@ mod metrics;
 mod panic_recovery;
 mod path_policy;
 mod rtc;
+mod runtime_config;
 mod server;
 mod stun;
 mod tus;
+mod windows_service;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -21,12 +23,12 @@ use dav_server::DavHandler;
 use dav_server::localfs::LocalFs;
 use tracing::{debug, info};
 
-use crate::auth::{AuthConfig, auth_middleware, build_auth_from_args, build_auth_from_config, extract_sign_param, extract_uuid_from_sign};
-use crate::config::cli::Args;
-use crate::config::{FileConfig, load_config};
+use crate::auth::{AuthConfig, auth_middleware, build_auth_from_args, build_auth_from_live_config, extract_sign_param, extract_uuid_from_sign};
+use crate::config::cli::{Cli, Command, RunArgs, WindowsServiceArgs};
 use crate::dav::ChecksumAwareFileSystem;
 use crate::dav::checksum::{ChecksumAlgorithm, ChecksumManager};
 use crate::path_policy::PathPolicy;
+use crate::runtime_config::{LiveConfigHandle, build_live_runtime_config, effective_stun_config, load_service_config_source, spawn_remote_refresh_loop};
 use crate::server::selfsign::RotatingCertResolver;
 use crate::stun::StunConfig;
 use crate::tus::{TusConfig, TusUploadManager};
@@ -68,47 +70,20 @@ fn build_router(
             )
         }))
         .route("/minio/metrics/v3/bucket/api/dfs", {
-            let credentials: Option<(String, String)> = auth.basic_username()
-                .zip(auth.basic_password())
-                .map(|(u, p)| (u.to_string(), p.to_string()));
+            let auth = auth.clone();
             axum::routing::get(move |headers: axum::http::HeaderMap| {
-                let credentials = credentials.clone();
+                let auth = auth.clone();
                 async move {
-                    // If basic auth is configured, require either a valid MinIO JWT or Basic Auth
-                    if let Some((ref username, ref password)) = credentials {
-                        let auth_header = headers
-                            .get(axum::http::header::AUTHORIZATION)
-                            .and_then(|v| v.to_str().ok());
+                    let auth_header = headers
+                        .get(axum::http::header::AUTHORIZATION)
+                        .and_then(|v| v.to_str().ok());
 
-                        let authorized = match auth_header {
-                            // MinIO-compatible JWT: Bearer <token>
-                            Some(h) if h.starts_with("Bearer ") => {
-                                metrics::validate_minio_jwt(&h[7..], password)
-                            }
-                            // WebDAV Basic Auth: Basic <base64>
-                            Some(h) if h.starts_with("Basic ") => {
-                                use base64::Engine;
-                                base64::engine::general_purpose::STANDARD
-                                    .decode(&h[6..])
-                                    .ok()
-                                    .and_then(|bytes| String::from_utf8(bytes).ok())
-                                    .map(|decoded| {
-                                        decoded.split_once(':')
-                                            .map(|(u, p)| u == username && p == password)
-                                            .unwrap_or(false)
-                                    })
-                                    .unwrap_or(false)
-                            }
-                            _ => false,
-                        };
-
-                        if !authorized {
-                            return (
-                                axum::http::StatusCode::UNAUTHORIZED,
-                                [(axum::http::header::CONTENT_TYPE, "text/plain; charset=utf-8")],
-                                String::from("Unauthorized"),
-                            );
-                        }
+                    if !auth.authorize_metrics_request(auth_header) {
+                        return (
+                            axum::http::StatusCode::UNAUTHORIZED,
+                            [(axum::http::header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+                            String::from("Unauthorized"),
+                        );
                     }
                     let body = metrics::gather_minio_compat_metrics();
                     (
@@ -217,84 +192,160 @@ async fn handle_lock(
     .await
 }
 
-/// Build TusConfig + temp_dir from a parsed config file's TUS section.
-fn build_tus_from_config(
-    tus_file: &crate::config::TusFileConfig,
-    root: &std::path::Path,
-) -> (TusConfig, PathBuf) {
+/// Build TusConfig + temp_dir from CLI args.
+fn build_tus_from_args(args: &RunArgs, root: &std::path::Path) -> Option<(TusConfig, PathBuf)> {
+    let enabled = args.enable_tus
+        || args.tus_temp_dir.is_some()
+        || args.tus_upload_timeout_hours.is_some()
+        || args.tus_max_concurrent_uploads.is_some()
+        || args.tus_max_upload_size.is_some();
+
+    if !enabled {
+        return None;
+    }
+
     let config = TusConfig {
-        enabled: tus_file.enabled.unwrap_or(true),
-        upload_timeout_hours: tus_file.upload_timeout_hours.unwrap_or(24),
-        max_concurrent_uploads: tus_file.max_concurrent_uploads.unwrap_or(100),
-        max_upload_size: tus_file.max_upload_size.unwrap_or(5 * 1024 * 1024 * 1024),
+        enabled: true,
+        upload_timeout_hours: args.tus_upload_timeout_hours.unwrap_or(24),
+        max_concurrent_uploads: args.tus_max_concurrent_uploads.unwrap_or(100),
+        max_upload_size: args.tus_max_upload_size.unwrap_or(5 * 1024 * 1024 * 1024),
     };
 
-    let temp_dir = tus_file
-        .temp_dir
+    let temp_dir = args
+        .tus_temp_dir
         .as_ref()
         .map(PathBuf::from)
         .unwrap_or_else(|| root.join(".tus-tmp"));
 
-    (config, temp_dir)
+    Some((config, temp_dir))
 }
 
 const TOKIO_WORKER_STACK_SIZE: usize = 16 * 1024 * 1024;
 
 fn main() -> anyhow::Result<()> {
-    // Install the ring crypto provider before any rustls usage (quinn, tokio-rustls, etc.)
-    rustls::crypto::aws_lc_rs::default_provider()
-        .install_default()
-        .expect("Failed to install rustls crypto provider");
+    let cli = Cli::parse();
+    cli.validate()?;
 
+    if let Some(Command::WindowsService(cmd)) = cli.command {
+        return handle_windows_service_command(cmd);
+    }
+
+    init_console_logging();
+    run_with_runtime(cli.run)
+}
+
+fn init_console_logging() {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
+}
+
+fn run_with_runtime(args: RunArgs) -> anyhow::Result<()> {
+    // Install the ring crypto provider before any rustls usage (quinn, tokio-rustls, etc.)
+    rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .expect("Failed to install rustls crypto provider");
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_stack_size(TOKIO_WORKER_STACK_SIZE)
         .build()?;
 
-    rt.block_on(async_main())
+    rt.block_on(async_main(args))
 }
 
-async fn async_main() -> anyhow::Result<()> {
+fn handle_windows_service_command(cmd: WindowsServiceArgs) -> anyhow::Result<()> {
+    if cmd.service_supervisor {
+        #[cfg(windows)]
+        {
+            windows_service::setup_file_logging()?;
+            let service_name = cmd
+                .service_name
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("--service-name is required in supervisor mode"))?;
+            return windows_service::run_as_service(service_name, cmd.run);
+        }
 
-    let args = Args::parse();
-    args.validate()?;
+        #[cfg(not(windows))]
+        {
+            anyhow::bail!("windows-service supervisor mode is only supported on Windows");
+        }
+    }
 
+    if cmd.service_child {
+        #[cfg(windows)]
+        {
+            windows_service::setup_file_logging()?;
+        }
+
+        #[cfg(not(windows))]
+        {
+            init_console_logging();
+        }
+
+        return run_with_runtime(cmd.run);
+    }
+
+    if let Some(name) = cmd.install {
+        #[cfg(windows)]
+        {
+            init_console_logging();
+            return windows_service::install_service(&name, &cmd.run);
+        }
+
+        #[cfg(not(windows))]
+        {
+            anyhow::bail!("windows-service install is only supported on Windows");
+        }
+    }
+
+    if let Some(name) = cmd.uninstall {
+        #[cfg(windows)]
+        {
+            init_console_logging();
+            return windows_service::uninstall_service(&name);
+        }
+
+        #[cfg(not(windows))]
+        {
+            anyhow::bail!("windows-service uninstall is only supported on Windows");
+        }
+    }
+
+    anyhow::bail!("Invalid windows-service command")
+}
+
+async fn async_main(args: RunArgs) -> anyhow::Result<()> {
     let root = PathBuf::from(&args.root).canonicalize()?;
     info!("Serving directory: {}", root.display());
     let path_policy = Arc::new(PathPolicy::new(root.clone(), &args.allow_link_target)?);
 
-    // Load config file or use CLI args
-    let file_config: Option<FileConfig> = if let Some(config_path) = &args.config {
-        let path = std::path::Path::new(config_path);
-        let cfg = load_config(path)?;
-        info!("Loaded config from: {}", config_path);
-        Some(cfg)
-    } else {
-        None
-    };
+    let service_config = load_service_config_source(&args).await?;
+    if let Some(config_url) = &args.config_url {
+        info!("Loaded service config from remote URL: {config_url}");
+    } else if let Some(config_path) = &args.config {
+        info!("Loaded service config from: {config_path}");
+    }
 
-    // Build auth
-    let mut auth = if let Some(ref fc) = file_config {
-        build_auth_from_config(fc, &args.prefix)
+    let auth = if let Some(ref cfg) = service_config {
+        build_auth_from_live_config(&cfg.live.auth, &args.prefix, args.no_tcp_download)
     } else {
         build_auth_from_args(&args)
     };
-    // Override no_tcp_download from CLI (config file doesn't have this setting)
-    if args.no_tcp_download {
-        auth.no_tcp_download = true;
+    let live_config = LiveConfigHandle::new(build_live_runtime_config(&args, service_config.as_ref()));
+    let effective_stun = effective_stun_config(&args, service_config.as_ref());
+
+    if args.enable_rtc && effective_stun.is_none() {
+        anyhow::bail!(
+            "--enable-rtc requires STUN config from either CLI flags or the service config"
+        );
     }
 
-    // Build TUS manager (if configured)
-    let tus_manager: Option<Arc<TusUploadManager>> = if let Some(ref fc) = file_config {
-        if let Some(ref tus_file) = fc.tus {
-            let (tus_config, temp_dir) = build_tus_from_config(tus_file, &root);
+    let tus_manager: Option<Arc<TusUploadManager>> =
+        if let Some((tus_config, temp_dir)) = build_tus_from_args(&args, &root) {
             if tus_config.enabled {
                 let mgr = TusUploadManager::new(temp_dir, tus_config, path_policy.clone())?;
                 info!("TUS resumable uploads enabled");
@@ -304,12 +355,8 @@ async fn async_main() -> anyhow::Result<()> {
             }
         } else {
             None
-        }
-    } else {
-        None
-    };
+        };
 
-    // Spawn TUS cleanup task if enabled
     if let Some(ref mgr) = tus_manager {
         let cleanup_mgr = mgr.clone();
         panic_recovery::spawn_catch_panic("tus-cleanup", async move {
@@ -364,22 +411,14 @@ async fn async_main() -> anyhow::Result<()> {
         path_policy.clone(),
     );
 
-    // Resolve the ClientIpSource for real-ip support.
-    // CLI --real-ip takes priority over config file real_ip field.
-    let real_ip_source: ClientIpSource = {
-        let raw = args
-            .real_ip
-            .as_deref()
-            .or(file_config.as_ref().and_then(|fc| fc.real_ip.as_deref()));
-        match raw {
-            Some(s) => s.parse::<ClientIpSource>().unwrap_or_else(|_| {
-                tracing::warn!(
-                    "Unknown --real-ip value '{s}', falling back to ConnectInfo"
-                );
-                ClientIpSource::ConnectInfo
-            }),
-            None => ClientIpSource::ConnectInfo,
-        }
+    let real_ip_source: ClientIpSource = match args.real_ip.as_deref() {
+        Some(s) => s.parse::<ClientIpSource>().unwrap_or_else(|_| {
+            tracing::warn!(
+                "Unknown --real-ip value '{s}', falling back to ConnectInfo"
+            );
+            ClientIpSource::ConnectInfo
+        }),
+        None => ClientIpSource::ConnectInfo,
     };
     if !matches!(real_ip_source, ClientIpSource::ConnectInfo) {
         info!("Real-IP enabled: source = {real_ip_source:?}");
@@ -393,14 +432,12 @@ async fn async_main() -> anyhow::Result<()> {
             .layer(source.into_extension())
     }
 
-    // Determine TLS source: file-based or self-signed
     let needs_tls = args.https_port.is_some() || args.http3_port.is_some();
     let tls_source: Option<TlsSource> = if needs_tls {
         if let (Some(cert_path), Some(key_path)) = (&args.cert, &args.key) {
             let cert = PathBuf::from(cert_path);
             let key = PathBuf::from(key_path);
 
-            // --ssl-generate: check cert validity & system trust, regenerate if needed
             if args.ssl_generate {
                 match server::ssl_generate::maybe_regenerate_cert(&cert, &key) {
                     Ok(true) => info!("Certificate was regenerated"),
@@ -420,23 +457,12 @@ async fn async_main() -> anyhow::Result<()> {
         None
     };
 
-    // Resolve STUN config (CLI > config file > none)
     let stun_config: Option<StunConfig> = {
-        // Collect server strings: CLI args take priority, fallback to config file
-        let server_strs: Vec<String> = if !args.stun_server.is_empty() {
-            args.stun_server.clone()
-        } else if let Some(ref fc) = file_config {
-            fc.stun.as_ref().map(|s| s.all_servers()).unwrap_or_default()
-        } else {
-            vec![]
-        };
-
-        let stun_interval_secs = args.stun_interval_secs.or_else(|| {
-            file_config
-                .as_ref()
-                .and_then(|fc| fc.stun.as_ref())
-                .and_then(|s| s.interval_secs)
-        });
+        let server_strs: Vec<String> = effective_stun
+            .as_ref()
+            .map(|stun| stun.servers.clone())
+            .unwrap_or_default();
+        let stun_interval_secs = effective_stun.as_ref().and_then(|stun| stun.interval_secs);
 
         if !server_strs.is_empty() {
             use std::net::ToSocketAddrs;
@@ -462,7 +488,6 @@ async fn async_main() -> anyhow::Result<()> {
             if all_addrs.is_empty() {
                 anyhow::bail!("No STUN server addresses could be resolved");
             }
-            // Deduplicate
             all_addrs.sort();
             all_addrs.dedup();
             let interval = Duration::from_secs(stun_interval_secs.unwrap_or(20));
@@ -470,7 +495,10 @@ async fn async_main() -> anyhow::Result<()> {
                 "STUN NAT traversal configured: {} address(es) (interval: {interval:?})",
                 all_addrs.len()
             );
-            Some(StunConfig { servers: all_addrs, interval })
+            Some(StunConfig {
+                servers: all_addrs,
+                interval,
+            })
         } else {
             None
         }
@@ -479,7 +507,6 @@ async fn async_main() -> anyhow::Result<()> {
     let mut handles = Vec::new();
     let mut h3_endpoint: Option<quinn::Endpoint> = None;
 
-    // HTTP server
     if let Some(port) = args.http_port {
         let http_app = build_protocol_app(app.clone(), "http", real_ip_source.clone());
         handles.push(panic_recovery::spawn_catch_panic("http-server", async move {
@@ -489,7 +516,6 @@ async fn async_main() -> anyhow::Result<()> {
         }));
     }
 
-    // SSH server (HTTP-over-SSH via direct-tcpip port forwarding)
     if let Some(port) = args.ssh_port {
         let host_key = args
             .ssh_host_key
@@ -517,7 +543,6 @@ async fn async_main() -> anyhow::Result<()> {
         }));
     }
 
-    // HTTPS server
     if let Some(port) = args.https_port {
         let https_app = build_protocol_app(app.clone(), "http", real_ip_source.clone());
         let https_config = match tls_source.as_ref().unwrap() {
@@ -533,7 +558,6 @@ async fn async_main() -> anyhow::Result<()> {
         }));
     }
 
-    // HTTP/3 server (with optional STUN NAT traversal + WebTransport)
     if let Some(port) = args.http3_port {
         let h3_app = build_protocol_app(app.clone(), "h3", real_ip_source);
         let quic_config = match tls_source.as_ref().unwrap() {
@@ -548,45 +572,51 @@ async fn async_main() -> anyhow::Result<()> {
             prefix: args.prefix.clone(),
             path_policy: path_policy.clone(),
         };
-        let h3_handle = server::http3::spawn(port, quic_config, h3_app, stun_config, wt_config, rtc_tx_for_h3)?;
+        let h3_handle = server::http3::spawn(
+            port,
+            quic_config,
+            h3_app,
+            stun_config,
+            wt_config,
+            rtc_tx_for_h3,
+        )?;
 
-        // Log public address discovery in background (if STUN enabled)
-        // and optionally notify via webhook.
-        // Clone the receiver before moving into the webhook task so the
-        // RtcManager can also observe public address changes.
         let public_addr_for_rtc = h3_handle.public_addr.clone();
         let mut public_addr_rx = h3_handle.public_addr;
-        let webhook_url = args.webhook_url.clone().or_else(|| {
-            file_config.as_ref().and_then(|fc| fc.webhook_url.clone())
-        });
+        let webhook_config = live_config.clone();
         panic_recovery::spawn_catch_panic("addr-watcher", async move {
-            // Build a reusable HTTP client for webhook calls
-            let webhook_client = webhook_url.as_deref().map(|raw_url| {
-                build_webhook_client(raw_url)
-            });
-
             while public_addr_rx.changed().await.is_ok() {
-                let addrs: std::collections::HashSet<std::net::SocketAddr> = public_addr_rx.borrow_and_update().clone();
+                let addrs: std::collections::HashSet<std::net::SocketAddr> =
+                    public_addr_rx.borrow_and_update().clone();
                 if addrs.is_empty() {
                     continue;
                 }
-                // borrow dropped here (cloned) — safe to .await below
-                let addrs_str: Vec<String> = addrs.iter().map(|a| a.to_string()).collect();
+
+                let addrs_str: Vec<String> = addrs.iter().map(|addr| addr.to_string()).collect();
                 let body = addrs_str.join(",");
                 info!("Public UDP endpoint(s) available: {body}");
 
-                // Fire webhook if configured
-                if let Some(Ok((client, url, auth))) = &webhook_client {
-                    let mut req = client.post(url.clone()).body(body.clone());
-                    if let Some((user, pass)) = auth {
-                        req = req.basic_auth(user, Some(pass));
-                    }
-                    match req.send().await {
-                        Ok(resp) => {
-                            info!("Webhook notified: {body} → {} {}", url, resp.status());
+                if let Some(webhook_url) = webhook_config.load_full().webhook_url.clone() {
+                    match build_webhook_client(
+                        &webhook_url,
+                        args.dangerous_ignore_ssl_certificate,
+                    ) {
+                        Ok((client, url, auth)) => {
+                            let mut req = client.post(url.clone()).body(body.clone());
+                            if let Some((user, pass)) = auth.as_ref() {
+                                req = req.basic_auth(user, Some(pass));
+                            }
+                            match req.send().await {
+                                Ok(resp) => {
+                                    info!("Webhook notified: {body} → {} {}", url, resp.status());
+                                }
+                                Err(e) => {
+                                    tracing::warn!("Webhook failed: {e}");
+                                }
+                            }
                         }
                         Err(e) => {
-                            tracing::warn!("Webhook failed: {e}");
+                            tracing::warn!("Invalid webhook URL '{webhook_url}': {e}");
                         }
                     }
                 }
@@ -595,7 +625,6 @@ async fn async_main() -> anyhow::Result<()> {
 
         h3_endpoint = Some(h3_handle.endpoint);
 
-        // Spawn RtcManager if WebRTC is enabled
         if let Some((cmd_rx, rtc_rx)) = rtc_rx_holder {
             let udp_tx = h3_handle
                 .udp_socket
@@ -619,41 +648,43 @@ async fn async_main() -> anyhow::Result<()> {
         }));
     }
 
-    // Spawn self-signed cert refresh task if using auto-generated certs
     if let Some(TlsSource::SelfSigned(resolver)) = tls_source {
         server::selfsign::spawn_refresh_task(resolver, h3_endpoint);
     }
 
-    // --- Metrics push ---
-    // Merge URLs from CLI and config file; if both define an interval, take the smaller.
-    {
-        let mut push_urls: Vec<String> = args.metrics_push_url.clone();
-        let mut interval_secs: Option<u64> = args.metrics_push_interval_secs;
-
-        if let Some(ref mp) = file_config.as_ref().and_then(|c| c.metrics_push.as_ref()) {
-            push_urls.extend(mp.all_urls());
-            if let Some(cfg_interval) = mp.interval_secs {
-                interval_secs = Some(match interval_secs {
-                    Some(cli_interval) => cli_interval.min(cfg_interval),
-                    None => cfg_interval,
-                });
-            }
-        }
-
-        if !push_urls.is_empty() {
-            let interval = std::time::Duration::from_secs(interval_secs.unwrap_or(15));
+    let initial_metrics = live_config.load_full();
+    if args.config_url.is_some() || !initial_metrics.metrics_push.urls.is_empty() {
+        if !initial_metrics.metrics_push.urls.is_empty() {
             info!(
                 "Starting metrics push to {} target(s), interval={}s",
-                push_urls.len(),
-                interval.as_secs()
+                initial_metrics.metrics_push.urls.len(),
+                initial_metrics.metrics_push.interval.as_secs()
             );
-            metrics::spawn_metrics_push(push_urls, interval);
+        } else {
+            info!("Starting dynamic metrics push task (awaiting remote targets)");
         }
+        metrics::spawn_metrics_push_dynamic(
+            live_config.clone(),
+            args.dangerous_ignore_ssl_certificate,
+        );
+    }
+
+    if let Some(initial_service_config) = service_config.clone()
+        && args.config_url.is_some()
+    {
+        let restart_required = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let _refresh_task = spawn_remote_refresh_loop(
+            args.clone(),
+            auth.clone(),
+            live_config.clone(),
+            initial_service_config,
+            effective_stun.clone(),
+            restart_required,
+        )?;
     }
 
     info!("All servers started. Press Ctrl+C to stop.");
 
-    // Wait for all servers (they run indefinitely)
     for handle in handles {
         handle.await?;
     }
@@ -673,7 +704,10 @@ enum TlsSource {
 /// `.basic_auth()`.
 type WebhookConfig = (reqwest::Client, String, Option<(String, String)>);
 
-fn build_webhook_client(raw_url: &str) -> anyhow::Result<WebhookConfig> {
+fn build_webhook_client(
+    raw_url: &str,
+    ignore_invalid_certs: bool,
+) -> anyhow::Result<WebhookConfig> {
     let parsed = url::Url::parse(raw_url)
         .map_err(|e| anyhow::anyhow!("Invalid webhook URL: {e}"))?;
 
@@ -694,7 +728,7 @@ fn build_webhook_client(raw_url: &str) -> anyhow::Result<WebhookConfig> {
     let clean_url = clean.to_string();
 
     let client = reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)
+        .danger_accept_invalid_certs(ignore_invalid_certs)
         .build()?;
 
     Ok((client, clean_url, auth))

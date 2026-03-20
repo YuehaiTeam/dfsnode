@@ -48,9 +48,7 @@ pub async fn serve(
 
     let mut method = russh::MethodSet::empty();
     method.push(russh::MethodKind::Password);
-    if !auth.has_any_auth() {
-        method.push(russh::MethodKind::None);
-    }
+    method.push(russh::MethodKind::None);
 
     let config = russh::server::Config {
         keys: vec![host_key],
@@ -175,11 +173,7 @@ impl russh::server::Handler for SshHandler {
         let path = normalize_ssh_username(user);
 
         // Mode 1: WebDAV basic-auth credentials
-        let basic_ok = self
-            .auth
-            .basic_username()
-            .zip(self.auth.basic_password())
-            .is_some_and(|(u, p)| u == user && p == password);
+        let basic_ok = self.auth.matches_basic_credentials(user, password);
 
         // Mode 2: Signature — normalized username is a file path, password is the sign value
         let (sign_ok, sign_uuid) = if !basic_ok {

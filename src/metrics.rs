@@ -4,6 +4,8 @@ use prometheus::{register_int_counter_vec, Encoder, IntCounterVec, TextEncoder};
 use serde::Deserialize;
 use std::time::{Duration, Instant};
 
+use crate::runtime_config::LiveConfigHandle;
+
 /// Flush bytes counter when pending bytes reaches this threshold.
 pub const STREAMING_FLUSH_BYTES_THRESHOLD: u64 = 8 * 1024 * 1024;
 /// Flush bytes counter at least this often during active sending.
@@ -334,40 +336,14 @@ fn parse_push_url(raw: &str) -> Result<PushTarget, url::ParseError> {
     })
 }
 
-/// Spawn a background task that periodically pushes metrics to one or more
-/// remote endpoints (e.g. VictoriaMetrics `/api/v1/import/prometheus`).
-///
-/// Each push sends **both** the standard Prometheus text format and the
-/// MinIO-compatible format concatenated into a single body.
-///
-/// * `urls`     – raw push URLs (may contain basic-auth credentials).
-/// * `interval` – time between consecutive pushes.
-pub fn spawn_metrics_push(urls: Vec<String>, interval: Duration) {
-    let targets: Vec<PushTarget> = urls
-        .iter()
-        .filter_map(|raw| match parse_push_url(raw) {
-            Ok(t) => {
-                tracing::info!(
-                    "Metrics push target: {} (auth={})",
-                    t.url,
-                    t.auth.is_some()
-                );
-                Some(t)
-            }
-            Err(e) => {
-                tracing::warn!("Invalid metrics push URL '{}': {}", raw, e);
-                None
-            }
-        })
-        .collect();
-
-    if targets.is_empty() {
-        return;
-    }
-
-    // One shared client for all targets.
+/// Spawn a background task that periodically pushes metrics using the current
+/// live runtime config.
+pub fn spawn_metrics_push_dynamic(
+    live_config: LiveConfigHandle,
+    ignore_invalid_certs: bool,
+) {
     let client = match reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)
+        .danger_accept_invalid_certs(ignore_invalid_certs)
         .build()
     {
         Ok(c) => c,
@@ -378,13 +354,27 @@ pub fn spawn_metrics_push(urls: Vec<String>, interval: Duration) {
     };
 
     crate::panic_recovery::spawn_catch_panic("metrics-push", async move {
-        let mut ticker = tokio::time::interval(interval);
-        // The first tick fires immediately — skip it so we don't push at
-        // startup before any real data has been collected.
-        ticker.tick().await;
-
         loop {
-            ticker.tick().await;
+            let interval = live_config.load_full().metrics_push.interval;
+            tokio::time::sleep(interval).await;
+
+            let snapshot = live_config.load_full();
+            let targets: Vec<PushTarget> = snapshot
+                .metrics_push
+                .urls
+                .iter()
+                .filter_map(|raw| match parse_push_url(raw) {
+                    Ok(target) => Some(target),
+                    Err(e) => {
+                        tracing::warn!("Invalid metrics push URL '{}': {}", raw, e);
+                        None
+                    }
+                })
+                .collect();
+
+            if targets.is_empty() {
+                continue;
+            }
 
             // Gather both formats and concatenate.
             let standard = gather_metrics();

@@ -52,7 +52,7 @@ clap = { version = "4", features = ["derive"] }
 
 # STUN NAT traversal
 stun-types = "0.1"
-time = "0.3"
+time = { version = "0.3", features = ["serde", "parsing", "formatting"] }
 
 # Checksums
 sha1 = "0.10"
@@ -117,6 +117,9 @@ lazy_static = "1.5"
 
 [profile.dev]
 debug = "line-tables-only"
+
+[target.'cfg(windows)'.dependencies]
+windows-service = "0.8"
 
 [patch.crates-io]
 # Use local fork of sctp-proto with increased buffer size for high-bandwidth WAN links

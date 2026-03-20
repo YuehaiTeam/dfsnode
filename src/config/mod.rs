@@ -5,20 +5,39 @@ use std::path::Path;
 
 use anyhow::{bail, Context};
 use serde::Deserialize;
+use time::OffsetDateTime;
 
-/// Top-level YAML configuration file.
-#[derive(Deserialize, Debug)]
-pub struct FileConfig {
+/// Top-level service configuration document.
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ServiceConfig {
     pub version: u64,
-    pub username: Option<String>,
-    pub password: Option<String>,
-    pub sign_key: Option<String>,
-    /// Trust reverse-proxy headers for client IP extraction.
-    /// Accepted values: XRealIp, RightmostXForwardedFor, CfConnectingIp, etc.
-    pub real_ip: Option<String>,
-    pub paths: Option<HashMap<String, PathAuthConfig>>,
-    pub tus: Option<TusFileConfig>,
+    #[serde(default)]
+    pub revision: Option<String>,
+    /// Ask the client to refresh the configuration again no later than this time.
+    #[serde(default, with = "time::serde::rfc3339::option")]
+    pub valid_until: Option<OffsetDateTime>,
+    /// Graceful period in seconds for the auth material in THIS config once it
+    /// gets replaced by a newer config.
+    #[serde(default)]
+    pub graceful_period: Option<u64>,
+    #[serde(default)]
+    pub startup: StartupConfig,
+    #[serde(default)]
+    pub live: LiveConfig,
+}
+
+#[derive(Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct StartupConfig {
     pub stun: Option<StunFileConfig>,
+}
+
+#[derive(Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct LiveConfig {
+    #[serde(default)]
+    pub auth: LiveAuthConfig,
     /// Webhook URL to call when STUN-discovered public address changes.
     /// Supports basic auth in URL: "https://user:pass@host/path"
     pub webhook_url: Option<String>,
@@ -26,32 +45,43 @@ pub struct FileConfig {
     pub metrics_push: Option<MetricsPushFileConfig>,
 }
 
+#[derive(Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct LiveAuthConfig {
+    pub username: Option<String>,
+    pub password: Option<String>,
+    pub sign_key: Option<String>,
+    pub paths: Option<HashMap<String, PathAuthConfig>>,
+}
+
 /// Per-path authentication override.
-#[derive(Deserialize, Debug, Clone)]
-pub struct PathAuthConfig {
-    pub signature: Option<SignatureSetting>,
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum PathAuthConfig {
+    Signature(SignatureSetting),
+    Detailed { signature: Option<SignatureSetting> },
+}
+
+impl PathAuthConfig {
+    pub fn signature(&self) -> Option<&SignatureSetting> {
+        match self {
+            Self::Signature(setting) => Some(setting),
+            Self::Detailed { signature } => signature.as_ref(),
+        }
+    }
 }
 
 /// `false` = open download (no auth for GET), `true` = use global key, `"key"` = per-path key.
-#[derive(Deserialize, Debug, Clone)]
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(untagged)]
 pub enum SignatureSetting {
     Open(bool),
     Key(String),
 }
 
-/// TUS resumable upload configuration from the config file.
-#[derive(Deserialize, Debug, Clone)]
-pub struct TusFileConfig {
-    pub enabled: Option<bool>,
-    pub temp_dir: Option<String>,
-    pub upload_timeout_hours: Option<u64>,
-    pub max_concurrent_uploads: Option<usize>,
-    pub max_upload_size: Option<u64>,
-}
-
 /// STUN NAT traversal configuration from the config file.
-#[derive(Deserialize, Debug, Clone)]
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct StunFileConfig {
     /// Single STUN server address (backward compat), e.g. "stun.l.google.com:19302"
     pub server: Option<String>,
@@ -76,7 +106,8 @@ impl StunFileConfig {
 }
 
 /// Metrics push configuration for remote-write to VictoriaMetrics / Prometheus.
-#[derive(Deserialize, Debug, Clone)]
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct MetricsPushFileConfig {
     /// Single push URL (backward compat), e.g. "http://user:pass@vm:8428/api/v1/import/prometheus"
     pub url: Option<String>,
@@ -99,26 +130,81 @@ impl MetricsPushFileConfig {
     }
 }
 
+/// Parse and validate a YAML service configuration document.
+pub fn parse_config_str(content: &str, source: &str) -> anyhow::Result<ServiceConfig> {
+    let config: ServiceConfig = serde_yaml::from_str(content)
+        .with_context(|| format!("Failed to parse config: {source}"))?;
+
+    validate_config(config)
+}
+
 /// Load and validate a YAML configuration file.
-pub fn load_config(path: &Path) -> anyhow::Result<FileConfig> {
+pub fn load_config(path: &Path) -> anyhow::Result<ServiceConfig> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("Failed to read config file: {}", path.display()))?;
 
-    let config: FileConfig = serde_yaml::from_str(&content)
-        .with_context(|| format!("Failed to parse config file: {}", path.display()))?;
+    parse_config_str(&content, &path.display().to_string())
+}
 
+fn validate_config(config: ServiceConfig) -> anyhow::Result<ServiceConfig> {
     // Validate version
-    if config.version != 1 {
+    if config.version != 2 {
         bail!(
-            "Unsupported config version: {}. Only version 1 is supported.",
+            "Unsupported config version: {}. Only version 2 is supported.",
             config.version
         );
     }
 
     // Validate username/password pairing
-    if config.username.is_some() != config.password.is_some() {
-        bail!("Config error: 'username' and 'password' must both be set or both omitted");
+    if config.live.auth.username.is_some() != config.live.auth.password.is_some() {
+        bail!(
+            "Config error: 'live.auth.username' and 'live.auth.password' must both be set or both omitted"
+        );
     }
 
     Ok(config)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_config_str, SignatureSetting};
+
+    #[test]
+    fn parses_service_config_with_path_shortcuts() {
+        let yaml = r#"
+version: 2
+valid_until: 2026-03-20T16:05:00Z
+graceful_period: 900
+startup:
+  stun:
+    servers:
+      - stun.l.google.com:19302
+live:
+  auth:
+    username: uploader
+    password: secret
+    paths:
+      /public: false
+      /protected: true
+      /special: deadbeef
+"#;
+
+        let config = parse_config_str(yaml, "inline-test").expect("config should parse");
+        let paths = config.live.auth.paths.expect("paths should exist");
+
+        assert_eq!(
+            paths.get("/public").and_then(|path| path.signature()),
+            Some(&SignatureSetting::Open(false))
+        );
+        assert_eq!(
+            paths.get("/protected").and_then(|path| path.signature()),
+            Some(&SignatureSetting::Open(true))
+        );
+        assert_eq!(
+            paths.get("/special").and_then(|path| path.signature()),
+            Some(&SignatureSetting::Key("deadbeef".to_string()))
+        );
+        assert_eq!(config.graceful_period, Some(900));
+        assert!(config.valid_until.is_some());
+    }
 }
