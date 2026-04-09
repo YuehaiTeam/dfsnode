@@ -11,7 +11,8 @@ use std::time::Duration;
 
 #[cfg(windows)]
 use windows_service::service::{
-    ServiceAccess, ServiceControl, ServiceControlAccept, ServiceErrorControl, ServiceExitCode,
+    ServiceAccess, ServiceAction, ServiceActionType, ServiceControl, ServiceControlAccept,
+    ServiceErrorControl, ServiceExitCode, ServiceFailureActions, ServiceFailureResetPeriod,
     ServiceInfo, ServiceStartType, ServiceState, ServiceStatus, ServiceType,
 };
 #[cfg(windows)]
@@ -72,8 +73,42 @@ pub fn install_service(service_name: &str, run_args: &RunArgs) -> anyhow::Result
         account_password: None,
     };
 
-    manager.create_service(&service_info, ServiceAccess::QUERY_STATUS)?;
+    let service = manager.create_service(
+        &service_info,
+        ServiceAccess::QUERY_STATUS | ServiceAccess::CHANGE_CONFIG,
+    )?;
+    configure_service_recovery(&service)?;
     tracing::info!("Installed Windows service: {}", service_name);
+    Ok(())
+}
+
+#[cfg(windows)]
+fn configure_service_recovery(service: &windows_service::service::Service) -> anyhow::Result<()> {
+    let restart_actions = vec![
+        ServiceAction {
+            action_type: ServiceActionType::Restart,
+            delay: Duration::from_secs(5),
+        },
+        ServiceAction {
+            action_type: ServiceActionType::Restart,
+            delay: Duration::from_secs(5),
+        },
+        ServiceAction {
+            action_type: ServiceActionType::Restart,
+            delay: Duration::from_secs(5),
+        },
+    ];
+
+    service.update_failure_actions(ServiceFailureActions {
+        reset_period: ServiceFailureResetPeriod::After(Duration::from_secs(24 * 60 * 60)),
+        reboot_msg: None,
+        command: None,
+        actions: Some(restart_actions),
+    })?;
+    service.set_failure_actions_on_non_crash_failures(true)?;
+    tracing::info!(
+        "Configured Windows service recovery: restart on failure (3 attempts, 5s delay)"
+    );
     Ok(())
 }
 
