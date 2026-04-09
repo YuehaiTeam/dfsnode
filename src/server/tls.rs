@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
 /// Load TLS certificate chain and private key from PEM files.
-fn load_certs_and_key(
+pub(crate) fn load_certs_and_key(
     cert_path: &Path,
     key_path: &Path,
 ) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
@@ -29,6 +29,16 @@ fn load_certs_and_key(
         .ok_or_else(|| anyhow::anyhow!("No private key found in {}", key_path.display()))?;
 
     Ok((certs, key))
+}
+
+/// Validate that the certificate and private key can build a rustls TLS config.
+pub(crate) fn validate_cert_key_pair(cert_path: &Path, key_path: &Path) -> Result<()> {
+    let (certs, key) = load_certs_and_key(cert_path, key_path)?;
+    rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .context("Failed to validate certificate and private key")?;
+    Ok(())
 }
 
 /// Build a rustls ServerConfig for HTTPS (HTTP/1.1 + HTTP/2 over TLS).

@@ -2,6 +2,7 @@
 //!
 //! When `--ssl-generate` is active, checks the provided certificate file:
 //! - If the file does not exist → generate a new self-signed cert.
+//! - If the certificate/private-key pair is missing or inconsistent → regenerate.
 //! - If the cert is NOT trusted by the system AND validity < 1 day → regenerate.
 
 use std::path::Path;
@@ -21,6 +22,24 @@ pub fn maybe_regenerate_cert(cert_path: &Path, key_path: &Path) -> anyhow::Resul
         info!(
             "Certificate file not found at {}, generating self-signed cert",
             cert_path.display()
+        );
+        generate_to_files(cert_path, key_path)?;
+        return Ok(true);
+    }
+
+    if !key_path.exists() {
+        info!(
+            "Private key file not found at {}, regenerating certificate pair",
+            key_path.display()
+        );
+        generate_to_files(cert_path, key_path)?;
+        return Ok(true);
+    }
+
+    if let Err(err) = super::tls::validate_cert_key_pair(cert_path, key_path) {
+        info!(
+            error = %format!("{err:#}"),
+            "Certificate and private key are inconsistent, regenerating"
         );
         generate_to_files(cert_path, key_path)?;
         return Ok(true);
@@ -155,4 +174,66 @@ fn generate_to_files(cert_path: &Path, key_path: &Path) -> anyhow::Result<()> {
         key_path.display()
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use rcgen::{CertificateParams, KeyPair, PKCS_ECDSA_P256_SHA256};
+    use sha2::Digest;
+
+    use super::maybe_regenerate_cert;
+
+    fn temp_file_path(name: &str) -> PathBuf {
+        let unique = uuid::Uuid::new_v4();
+        std::env::temp_dir().join(format!("dfsnode-ssl-generate-{name}-{unique}.pem"))
+    }
+
+    fn write_mismatched_pair(cert_path: &std::path::Path, key_path: &std::path::Path) {
+        let cert_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("generate cert key");
+        let wrong_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("generate wrong key");
+        let params = CertificateParams::new(vec!["localhost".to_string()]).expect("params");
+        let cert = params.self_signed(&cert_key).expect("self sign cert");
+
+        std::fs::write(cert_path, cert.pem()).expect("write cert");
+        std::fs::write(key_path, wrong_key.serialize_pem()).expect("write wrong key");
+    }
+
+    #[test]
+    fn regenerates_when_key_file_is_missing() {
+        let cert_path = temp_file_path("missing-cert");
+        let key_path = temp_file_path("missing-key");
+
+        write_mismatched_pair(&cert_path, &key_path);
+        std::fs::remove_file(&key_path).expect("remove key");
+
+        let regenerated = maybe_regenerate_cert(&cert_path, &key_path).expect("regenerate pair");
+        assert!(regenerated, "missing key should trigger regeneration");
+        super::super::tls::validate_cert_key_pair(&cert_path, &key_path)
+            .expect("regenerated pair should be valid");
+
+        let _ = std::fs::remove_file(&cert_path);
+        let _ = std::fs::remove_file(&key_path);
+    }
+
+    #[test]
+    fn regenerates_when_cert_and_key_do_not_match() {
+        let cert_path = temp_file_path("mismatch-cert");
+        let key_path = temp_file_path("mismatch-key");
+
+        write_mismatched_pair(&cert_path, &key_path);
+        let old_cert_hash = sha2::Sha256::digest(std::fs::read(&cert_path).expect("read old cert"));
+
+        let regenerated = maybe_regenerate_cert(&cert_path, &key_path).expect("regenerate pair");
+        assert!(regenerated, "mismatched pair should trigger regeneration");
+
+        let new_cert_hash = sha2::Sha256::digest(std::fs::read(&cert_path).expect("read new cert"));
+        assert_ne!(old_cert_hash[..], new_cert_hash[..], "certificate should be replaced");
+        super::super::tls::validate_cert_key_pair(&cert_path, &key_path)
+            .expect("regenerated pair should be valid");
+
+        let _ = std::fs::remove_file(&cert_path);
+        let _ = std::fs::remove_file(&key_path);
+    }
 }
