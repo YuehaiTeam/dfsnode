@@ -31,6 +31,17 @@ impl RotatingCertResolver {
         }))
     }
 
+    /// Create a resolver from an existing certificate chain and private key.
+    pub fn from_parts(
+        certs: Vec<CertificateDer<'static>>,
+        key_der: PrivateKeyDer<'static>,
+    ) -> anyhow::Result<Arc<Self>> {
+        let certified_key = certified_key_from_parts(certs, key_der)?;
+        Ok(Arc::new(Self {
+            current: ArcSwap::from(Arc::new(certified_key)),
+        }))
+    }
+
     /// Atomically replace the certificate.
     pub fn swap(&self, new_key: CertifiedKey) {
         self.current.store(Arc::new(new_key));
@@ -104,6 +115,14 @@ pub fn generate_self_signed()
 /// Generate a [`CertifiedKey`] for use with rustls `ResolvesServerCert`.
 fn generate_certified_key() -> anyhow::Result<CertifiedKey> {
     let (certs, key_der) = generate_self_signed()?;
+    let signing_key = rustls::crypto::aws_lc_rs::sign::any_supported_type(&key_der)?;
+    Ok(CertifiedKey::new(certs, signing_key))
+}
+
+pub fn certified_key_from_parts(
+    certs: Vec<CertificateDer<'static>>,
+    key_der: PrivateKeyDer<'static>,
+) -> anyhow::Result<CertifiedKey> {
     let signing_key = rustls::crypto::aws_lc_rs::sign::any_supported_type(&key_der)?;
     Ok(CertifiedKey::new(certs, signing_key))
 }

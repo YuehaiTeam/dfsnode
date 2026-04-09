@@ -444,15 +444,22 @@ async fn async_main(args: RunArgs) -> anyhow::Result<()> {
             let key = PathBuf::from(key_path);
 
             if args.ssl_generate {
-                match server::ssl_generate::maybe_regenerate_cert(&cert, &key) {
-                    Ok(true) => info!("Certificate was regenerated"),
-                    Ok(false) => {}
-                    Err(e) => tracing::warn!("Certificate check failed: {e}"),
+                match server::ssl_generate::prepare_tls_identity(&cert, &key)? {
+                    server::ssl_generate::PreparedTlsIdentity::Files => {
+                        info!("Using TLS certificate from: {}", cert.display());
+                        Some(TlsSource::File { cert, key })
+                    }
+                    server::ssl_generate::PreparedTlsIdentity::InMemory(resolver) => {
+                        tracing::warn!(
+                            "Using in-memory self-signed TLS certificate because persisting the regenerated pair failed"
+                        );
+                        Some(TlsSource::SelfSigned(resolver))
+                    }
                 }
+            } else {
+                info!("Using TLS certificate from: {}", cert.display());
+                Some(TlsSource::File { cert, key })
             }
-
-            info!("Using TLS certificate from: {}", cert.display());
-            Some(TlsSource::File { cert, key })
         } else {
             info!("No certificate provided — generating self-signed certificate (7-day validity)");
             let resolver = RotatingCertResolver::new()?;
