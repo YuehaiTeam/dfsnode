@@ -15,6 +15,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use anyhow::Context;
 use axum::Router;
 use axum::middleware;
 use axum_client_ip::ClientIpSource;
@@ -286,7 +287,11 @@ fn handle_windows_service_command(cmd: WindowsServiceArgs) -> anyhow::Result<()>
             init_console_logging();
         }
 
-        return run_with_runtime(cmd.run);
+        let result = run_with_runtime(cmd.run);
+        if let Err(err) = &result {
+            tracing::error!(error = %format!("{err:#}"), "Windows service child exited with error");
+        }
+        return result;
     }
 
     if let Some(name) = cmd.install {
@@ -509,10 +514,10 @@ async fn async_main(args: RunArgs) -> anyhow::Result<()> {
 
     if let Some(port) = args.http_port {
         let http_app = build_protocol_app(app.clone(), "http", real_ip_source.clone());
-        handles.push(panic_recovery::spawn_catch_panic("http-server", async move {
-            if let Err(e) = server::http::serve(port, http_app).await {
-                tracing::error!("HTTP server error: {e}");
-            }
+        handles.push(tokio::spawn(async move {
+            server::http::serve(port, http_app)
+                .await
+                .with_context(|| format!("HTTP server failed on port {port}"))
         }));
     }
 
@@ -526,8 +531,8 @@ async fn async_main(args: RunArgs) -> anyhow::Result<()> {
         let ssh_root = root.clone();
         let ssh_prefix = args.prefix.clone();
         let ssh_path_policy = path_policy.clone();
-        handles.push(panic_recovery::spawn_catch_panic("ssh-server", async move {
-            if let Err(e) = server::ssh::serve(
+        handles.push(tokio::spawn(async move {
+            server::ssh::serve(
                 port,
                 &PathBuf::from(host_key),
                 ssh_app,
@@ -537,9 +542,7 @@ async fn async_main(args: RunArgs) -> anyhow::Result<()> {
                 ssh_path_policy,
             )
             .await
-            {
-                tracing::error!("SSH server error: {e}");
-            }
+            .with_context(|| format!("SSH server failed on port {port}"))
         }));
     }
 
@@ -551,10 +554,10 @@ async fn async_main(args: RunArgs) -> anyhow::Result<()> {
                 server::selfsign::build_https_config_dynamic(resolver.clone())
             }
         };
-        handles.push(panic_recovery::spawn_catch_panic("https-server", async move {
-            if let Err(e) = server::https::serve(port, https_config, https_app).await {
-                tracing::error!("HTTPS server error: {e}");
-            }
+        handles.push(tokio::spawn(async move {
+            server::https::serve(port, https_config, https_app)
+                .await
+                .with_context(|| format!("HTTPS server failed on port {port}"))
         }));
     }
 
@@ -641,10 +644,12 @@ async fn async_main(args: RunArgs) -> anyhow::Result<()> {
             info!("WebRTC DataChannel enabled (LOCK method signaling)");
         }
 
-        handles.push(panic_recovery::spawn_catch_panic("h3-server", async move {
-            if let Err(e) = h3_handle.task.await {
-                tracing::error!("HTTP/3 server error: {e}");
-            }
+        handles.push(tokio::spawn(async move {
+            h3_handle
+                .task
+                .await
+                .context("HTTP/3 server task join failed")?
+                .with_context(|| format!("HTTP/3 server failed on port {port}"))
         }));
     }
 
@@ -686,7 +691,7 @@ async fn async_main(args: RunArgs) -> anyhow::Result<()> {
     info!("All servers started. Press Ctrl+C to stop.");
 
     for handle in handles {
-        handle.await?;
+        handle.await.context("server task join failed")??;
     }
 
     Ok(())

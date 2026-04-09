@@ -1,7 +1,7 @@
 #[cfg(windows)]
 use std::ffi::OsString;
 #[cfg(windows)]
-use std::process::{Child, Command};
+use std::process::{Child, Command, ExitStatus};
 #[cfg(windows)]
 use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(windows)]
@@ -150,7 +150,20 @@ fn run_service() -> windows_service::Result<()> {
         process_id: None,
     })?;
 
-    spawn_service_child().map_err(to_win_err)?;
+    if let Err(err) = spawn_service_child() {
+        tracing::error!(error = %format!("{err:#}"), "Failed to spawn Windows service child process");
+        let failure_exit_code = ServiceExitCode::ServiceSpecific(1);
+        status_handle.set_service_status(ServiceStatus {
+            service_type: ServiceType::OWN_PROCESS,
+            current_state: ServiceState::Stopped,
+            controls_accepted: ServiceControlAccept::empty(),
+            exit_code: failure_exit_code,
+            checkpoint: 0,
+            wait_hint: Duration::default(),
+            process_id: None,
+        })?;
+        return Err(to_win_err(err));
+    }
 
     status_handle.set_service_status(ServiceStatus {
         service_type: ServiceType::OWN_PROCESS,
@@ -162,23 +175,39 @@ fn run_service() -> windows_service::Result<()> {
         process_id: None,
     })?;
 
+    let mut service_exit_code = ServiceExitCode::Win32(0);
+
     loop {
+        let child_exit = poll_child_exit();
+
         if SHOULD_STOP.load(Ordering::Relaxed) {
-            kill_child_force();
+            match child_exit {
+                Some(Ok(status)) => {
+                    service_exit_code = log_child_exit(status);
+                }
+                Some(Err(err)) => {
+                    tracing::error!(error = %err, "Failed to query Windows service child status during stop");
+                    service_exit_code = ServiceExitCode::ServiceSpecific(1);
+                }
+                None => {
+                    tracing::info!("Windows service stop requested; terminating child process");
+                    kill_child_force();
+                }
+            }
             break;
         }
 
-        let exited = {
-            let mut guard = CHILD.lock().expect("child mutex poisoned");
-            if let Some(child) = guard.as_mut() {
-                matches!(child.try_wait(), Ok(Some(_)))
-            } else {
-                true
+        match child_exit {
+            Some(Ok(status)) => {
+                service_exit_code = log_child_exit(status);
+                break;
             }
-        };
-
-        if exited {
-            break;
+            Some(Err(err)) => {
+                tracing::error!(error = %err, "Failed to query Windows service child status");
+                service_exit_code = ServiceExitCode::ServiceSpecific(1);
+                break;
+            }
+            None => {}
         }
 
         std::thread::sleep(Duration::from_millis(100));
@@ -188,7 +217,7 @@ fn run_service() -> windows_service::Result<()> {
         service_type: ServiceType::OWN_PROCESS,
         current_state: ServiceState::StopPending,
         controls_accepted: ServiceControlAccept::empty(),
-        exit_code: ServiceExitCode::Win32(0),
+        exit_code: service_exit_code,
         checkpoint: 0,
         wait_hint: Duration::from_secs(3),
         process_id: None,
@@ -198,7 +227,7 @@ fn run_service() -> windows_service::Result<()> {
         service_type: ServiceType::OWN_PROCESS,
         current_state: ServiceState::Stopped,
         controls_accepted: ServiceControlAccept::empty(),
-        exit_code: ServiceExitCode::Win32(0),
+        exit_code: service_exit_code,
         checkpoint: 0,
         wait_hint: Duration::default(),
         process_id: None,
@@ -217,15 +246,60 @@ fn spawn_service_child() -> anyhow::Result<()> {
     command.args(run_args.to_cli_args());
 
     let child = command.spawn()?;
+    tracing::info!(pid = child.id(), "Spawned Windows service child process");
     let mut guard = CHILD.lock().expect("child mutex poisoned");
     *guard = Some(child);
     Ok(())
 }
 
 #[cfg(windows)]
+fn poll_child_exit() -> Option<std::io::Result<ExitStatus>> {
+    let mut guard = CHILD.lock().expect("child mutex poisoned");
+    match guard.take() {
+        Some(mut child) => match child.try_wait() {
+            Ok(Some(status)) => Some(Ok(status)),
+            Ok(None) => {
+                *guard = Some(child);
+                None
+            }
+            Err(err) => Some(Err(err)),
+        },
+        None => Some(Ok(success_exit_status())),
+    }
+}
+
+#[cfg(windows)]
+fn log_child_exit(status: ExitStatus) -> ServiceExitCode {
+    match status.code() {
+        Some(0) => {
+            tracing::info!("Windows service child exited normally");
+            ServiceExitCode::Win32(0)
+        }
+        Some(code) => {
+            let code = code as u32;
+            tracing::error!(exit_code = code, "Windows service child exited with failure");
+            ServiceExitCode::ServiceSpecific(code)
+        }
+        None => {
+            tracing::error!("Windows service child exited without an OS exit code");
+            ServiceExitCode::ServiceSpecific(1)
+        }
+    }
+}
+
+#[cfg(windows)]
+fn success_exit_status() -> ExitStatus {
+    #[cfg(windows)]
+    {
+        std::os::windows::process::ExitStatusExt::from_raw(0)
+    }
+}
+
+#[cfg(windows)]
 fn kill_child_force() {
     let mut guard = CHILD.lock().expect("child mutex poisoned");
     if let Some(mut child) = guard.take() {
+        tracing::info!(pid = child.id(), "Killing Windows service child process");
         let _ = child.kill();
         let _ = child.wait();
     }
