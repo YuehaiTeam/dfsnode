@@ -280,6 +280,7 @@ fn compile_auth_material(auth_config: &LiveAuthConfig) -> AuthMaterial {
     let sign_global = auth_config
         .sign_key
         .as_deref()
+        .or(auth_config.password.as_deref())
         .map(|key| Arc::new(SignatureVerifier::new(key)));
 
     let mut path_specific_sign = HashMap::new();
