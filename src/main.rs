@@ -32,8 +32,11 @@ use crate::path_policy::PathPolicy;
 use crate::runtime_config::{LiveConfigHandle, build_live_runtime_config, effective_stun_config, load_service_config_source, spawn_remote_refresh_loop};
 use crate::server::selfsign::RotatingCertResolver;
 use crate::stun::StunConfig;
+use crate::tus::handler::{
+    TusState, handle_directory_scoped_tus_create, is_directory_scoped_tus_create_request,
+    tus_routes,
+};
 use crate::tus::{TusConfig, TusUploadManager};
-use crate::tus::handler::tus_routes;
 
 fn build_router(
     root: &std::path::Path,
@@ -49,10 +52,14 @@ fn build_router(
         ChecksumAlgorithm::MD5,
     ]);
 
-    let fs = ChecksumAwareFileSystem::new(inner, checksum_manager, root.to_path_buf(), path_policy.clone());
+    let fs = ChecksumAwareFileSystem::new(
+        inner,
+        checksum_manager,
+        root.to_path_buf(),
+        path_policy.clone(),
+    );
 
-    let mut builder = DavHandler::builder()
-        .filesystem(Box::new(fs));
+    let mut builder = DavHandler::builder().filesystem(Box::new(fs));
 
     if prefix != "/" {
         builder = builder.strip_prefix(prefix);
@@ -96,33 +103,50 @@ fn build_router(
             })
         });
 
-    // If TUS is enabled, merge TUS routes BEFORE the DavHandler fallback
+    let mut tus_state_for_fallback = None;
     if let Some(mgr) = tus_manager {
-        router = router.merge(tus_routes(prefix, mgr, root.to_path_buf(), path_policy));
+        router = router.merge(tus_routes(
+            prefix,
+            mgr.clone(),
+            root.to_path_buf(),
+            path_policy.clone(),
+        ));
+        tus_state_for_fallback = Some(TusState {
+            manager: mgr,
+            root: root.to_path_buf(),
+            prefix: prefix.trim_end_matches('/').to_string(),
+            path_policy,
+        });
     }
 
-    // Build the fallback that handles both LOCK (WebRTC signaling) and
-    // regular WebDAV methods.  LOCK is checked first; everything else
-    // falls through to the DavHandler.
     let lock_prefix = prefix.to_string();
     router
         .fallback(move |req: axum::extract::Request| {
             let dav = dav.clone();
             let rtc_state = rtc_state.clone();
             let prefix = lock_prefix.clone();
+            let tus_state = tus_state_for_fallback.clone();
             async move {
                 use axum::response::IntoResponse;
 
-                // Check for LOCK method — dispatch to WebRTC handler
                 if req.method().as_str() == "LOCK" {
                     if let Some(state) = rtc_state {
                         return handle_lock(state, &prefix, req).await;
                     }
-                    // RTC not enabled — LOCK is not supported
                     return axum::http::StatusCode::NOT_IMPLEMENTED.into_response();
                 }
 
-                // All other methods → DavHandler
+                if let Some(state) = tus_state.as_ref()
+                    && is_directory_scoped_tus_create_request(
+                        req.method(),
+                        req.uri().path(),
+                        req.headers(),
+                        &state.prefix,
+                    )
+                {
+                    return handle_directory_scoped_tus_create(state.clone(), req).await;
+                }
+
                 dav.handle(req).await.into_response()
             }
         })
@@ -265,7 +289,6 @@ fn handle_windows_service_command(cmd: WindowsServiceArgs) -> anyhow::Result<()>
             windows_service::setup_file_logging()?;
             let service_name = cmd
                 .service_name
-                .clone()
                 .ok_or_else(|| anyhow::anyhow!("--service-name is required in supervisor mode"))?;
             return windows_service::run_as_service(service_name, cmd.run);
         }
@@ -744,4 +767,386 @@ fn build_webhook_client(
         .build()?;
 
     Ok((client, clean_url, auth))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_router;
+    use crate::auth::build_auth_from_live_config;
+    use crate::config::LiveAuthConfig;
+    use crate::path_policy::PathPolicy;
+    use crate::tus::{TusConfig, TusUploadManager};
+
+    use axum::body::Body;
+    use axum::http::{Method, Request, StatusCode};
+    use base64::{Engine as _, engine::general_purpose};
+    use http_body_util::BodyExt;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use tower::util::ServiceExt;
+
+    const TEST_USER: &str = "alice";
+    const TEST_PASS: &str = "secret";
+
+    fn make_temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "dfsnode-main-tests-{name}-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    fn build_test_router(prefix: &str) -> (axum::Router, PathBuf) {
+        let root = make_temp_dir("root");
+        let temp_dir = make_temp_dir("tus-temp");
+        let path_policy = Arc::new(PathPolicy::new(root.clone(), &[]).expect("path policy"));
+        let auth = build_auth_from_live_config(
+            &LiveAuthConfig {
+                username: Some(TEST_USER.to_string()),
+                password: Some(TEST_PASS.to_string()),
+                sign_key: None,
+                paths: None,
+            },
+            prefix,
+            false,
+        );
+        let tus_manager = Arc::new(
+            TusUploadManager::new(temp_dir, TusConfig::default(), path_policy.clone())
+                .expect("tus manager"),
+        );
+
+        (
+            build_router(
+                root.as_path(),
+                prefix,
+                auth,
+                Some(tus_manager),
+                None,
+                path_policy,
+            ),
+            root,
+        )
+    }
+
+    fn metadata_header(entries: &[(&str, &str)]) -> String {
+        entries
+            .iter()
+            .map(|(key, value)| format!("{} {}", key, general_purpose::STANDARD.encode(value)))
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    fn basic_auth_header() -> String {
+        format!(
+            "Basic {}",
+            general_purpose::STANDARD.encode(format!("{TEST_USER}:{TEST_PASS}"))
+        )
+    }
+
+    async fn send_request(router: &axum::Router, request: Request<Body>) -> axum::response::Response {
+        router.clone().oneshot(request).await.expect("request succeeds")
+    }
+
+    fn location_header(response: &axum::response::Response) -> String {
+        response
+            .headers()
+            .get("location")
+            .expect("location header")
+            .to_str()
+            .expect("location header utf8")
+            .to_string()
+    }
+
+    fn location_path(location: &str) -> String {
+        if location.starts_with("http://") || location.starts_with("https://") {
+            url::Url::parse(location)
+                .expect("absolute location parses")
+                .path()
+                .to_string()
+        } else {
+            location.to_string()
+        }
+    }
+
+    async fn create_upload(
+        router: &axum::Router,
+        path: &str,
+        metadata: &[(&str, &str)],
+        length: usize,
+        host: Option<&str>,
+        forwarded_proto: Option<&str>,
+    ) -> axum::response::Response {
+        let mut builder = Request::builder()
+            .method(Method::POST)
+            .uri(path)
+            .header("authorization", basic_auth_header())
+            .header("tus-resumable", "1.0.0")
+            .header("upload-length", length.to_string())
+            .header("upload-metadata", metadata_header(metadata));
+
+        if let Some(host) = host {
+            builder = builder.header("host", host);
+        }
+        if let Some(proto) = forwarded_proto {
+            builder = builder.header("x-forwarded-proto", proto);
+        }
+
+        send_request(router, builder.body(Body::empty()).unwrap()).await
+    }
+
+    async fn patch_upload(
+        router: &axum::Router,
+        location: &str,
+        body: &'static [u8],
+    ) -> axum::response::Response {
+        send_request(
+            router,
+            Request::builder()
+                .method(Method::PATCH)
+                .uri(location_path(location))
+                .header("authorization", basic_auth_header())
+                .header("tus-resumable", "1.0.0")
+                .header("content-type", "application/offset+octet-stream")
+                .header("upload-offset", "0")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+    }
+
+    async fn head_upload(router: &axum::Router, location: &str) -> axum::response::Response {
+        send_request(
+            router,
+            Request::builder()
+                .method(Method::HEAD)
+                .uri(location_path(location))
+                .header("authorization", basic_auth_header())
+                .header("tus-resumable", "1.0.0")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+    }
+
+    async fn response_text(response: axum::response::Response) -> String {
+        let body = response.into_body().collect().await.expect("collect body").to_bytes();
+        String::from_utf8_lossy(&body).into_owned()
+    }
+
+    #[tokio::test]
+    async fn directory_scoped_create_uses_request_path() {
+        let (router, root) = build_test_router("/remote");
+        let create = create_upload(
+            &router,
+            "/remote/copy",
+            &[("filename", "hello.txt"), ("directory", "ignored")],
+            5,
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(create.status(), StatusCode::CREATED);
+
+        let location = location_header(&create);
+        let patch = patch_upload(&router, &location, b"hello").await;
+        assert_eq!(patch.status(), StatusCode::NO_CONTENT);
+        assert_eq!(fs::read(root.join("copy").join("hello.txt")).unwrap(), b"hello");
+        assert!(!root.join("ignored").join("hello.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn directory_scoped_create_requires_filename() {
+        let (router, _) = build_test_router("/remote");
+        let response = create_upload(
+            &router,
+            "/remote/copy",
+            &[("mtime", "1710000000")],
+            1,
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = response_text(response).await;
+        assert!(body.contains("filename"));
+    }
+
+    #[tokio::test]
+    async fn directory_scoped_create_rejects_filename_with_separators() {
+        let (router, _) = build_test_router("/remote");
+        let response = create_upload(
+            &router,
+            "/remote/copy",
+            &[("filename", "sub/file.txt")],
+            1,
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn directory_scoped_create_returns_absolute_location_when_host_present() {
+        let (router, _) = build_test_router("/remote");
+        let response = create_upload(
+            &router,
+            "/remote/copy",
+            &[("filename", "hello.txt")],
+            5,
+            Some("example.test:8443"),
+            Some("https"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let location = location_header(&response);
+        assert!(location.starts_with("https://example.test:8443/remote/.tus-uploads/"));
+    }
+
+    #[tokio::test]
+    async fn create_returns_relative_location_without_host() {
+        let (router, _) = build_test_router("/remote");
+        let response = create_upload(
+            &router,
+            "/remote/copy",
+            &[("filename", "hello.txt")],
+            5,
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let location = location_header(&response);
+        assert!(location.starts_with("/remote/.tus-uploads/"));
+    }
+
+    #[tokio::test]
+    async fn directory_scoped_patch_finalizes_into_requested_directory() {
+        let (router, root) = build_test_router("/remote");
+        let create = create_upload(
+            &router,
+            "/remote/copy",
+            &[("filename", "payload.bin")],
+            5,
+            None,
+            None,
+        )
+        .await;
+        let location = location_header(&create);
+
+        let head = head_upload(&router, &location).await;
+        assert_eq!(head.status(), StatusCode::OK);
+        assert_eq!(head.headers().get("upload-offset").unwrap(), "0");
+
+        let patch = patch_upload(&router, &location, b"hello").await;
+        assert_eq!(patch.status(), StatusCode::NO_CONTENT);
+        assert_eq!(patch.headers().get("upload-offset").unwrap(), "5");
+        assert_eq!(fs::read(root.join("copy").join("payload.bin")).unwrap(), b"hello");
+    }
+
+    #[tokio::test]
+    async fn followup_requests_use_fixed_session_namespace() {
+        let (router, _) = build_test_router("/remote");
+        let create = create_upload(
+            &router,
+            "/remote/copy",
+            &[("filename", "payload.bin")],
+            5,
+            None,
+            None,
+        )
+        .await;
+        let location = location_header(&create);
+        assert!(location_path(&location).starts_with("/remote/.tus-uploads/"));
+
+        let head = head_upload(&router, &location).await;
+        assert_eq!(head.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn directory_scoped_root_create_succeeds() {
+        let (router, root) = build_test_router("/remote");
+        let create = create_upload(
+            &router,
+            "/remote",
+            &[("filename", "root.txt")],
+            4,
+            None,
+            None,
+        )
+        .await;
+        let location = location_header(&create);
+        let patch = patch_upload(&router, &location, b"root").await;
+        assert_eq!(patch.status(), StatusCode::NO_CONTENT);
+        assert_eq!(fs::read(root.join("root.txt")).unwrap(), b"root");
+    }
+
+    #[tokio::test]
+    async fn fixed_collection_create_still_allows_legacy_behavior() {
+        let (router, root) = build_test_router("/remote");
+        let create = create_upload(&router, "/remote/.tus-uploads", &[], 1, None, None).await;
+        assert_eq!(create.status(), StatusCode::CREATED);
+        let location = location_header(&create);
+        assert_eq!(patch_upload(&router, &location, b"x").await.status(), StatusCode::NO_CONTENT);
+
+        let entries: Vec<_> = fs::read_dir(&root)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0]
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap()
+            .starts_with("upload-"));
+    }
+
+    #[tokio::test]
+    async fn fixed_and_directory_modes_apply_different_filename_rules() {
+        let (router, root) = build_test_router("/remote");
+        let fixed = create_upload(&router, "/remote/.tus-uploads", &[], 1, None, None).await;
+        assert_eq!(fixed.status(), StatusCode::CREATED);
+        let fixed_location = location_header(&fixed);
+        assert_eq!(patch_upload(&router, &fixed_location, b"x").await.status(), StatusCode::NO_CONTENT);
+
+        let directory = create_upload(&router, "/remote/copy", &[], 1, None, None).await;
+        assert_eq!(directory.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn non_tus_post_still_reaches_dav_fallback() {
+        let (router, _) = build_test_router("/remote");
+        let response = send_request(
+            &router,
+            Request::builder()
+                .method(Method::POST)
+                .uri("/remote/copy")
+                .header("authorization", basic_auth_header())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_ne!(response.status(), StatusCode::CREATED);
+        assert!(response.headers().get("location").is_none());
+        assert!(response.headers().get("tus-resumable").is_none());
+    }
+
+    #[tokio::test]
+    async fn directory_scoped_tus_post_bypasses_dav_fallback() {
+        let (router, _) = build_test_router("/remote");
+        let response = create_upload(
+            &router,
+            "/remote/copy",
+            &[("filename", "hello.txt")],
+            1,
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+        assert!(response.headers().get("location").is_some());
+    }
 }
